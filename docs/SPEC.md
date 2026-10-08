@@ -107,15 +107,24 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 ### Phase 2 — Multi-Body Gravity
 - Add ability to place N bodies with mass and velocity. N² gravity between bodies and particles.
 - Real Kepler orbits, slingshot maneuvers, stable Lagrange points.
+- **Full spec:** [`docs/phase-2-multi-body-gravity.md`](phase-2-multi-body-gravity.md). Includes body storage, N² math, Verlet integration, event horizon / particle destruction.
 
 ### Phase 3 — Barnes-Hut Octree (if needed)
 - Performance: N² dies around 10k particles. Add an octree-based gravity solver on CPU; if that's still too slow, push to a wgpu compute shader.
+- **Full spec:** [`docs/phase-3-barnes-hut.md`](phase-3-barnes-hut.md). Quadtree structure, traversal algorithm, θ tuning, GPU compute deferred.
 
 ### Phase 4 — Bodies as First-Class Objects
 - "Place a planet" becomes a primitive. Bodies have mass, velocity, shape templates (sphere, ring, asteroid cluster). The emergent identity from Phase 1 gets explicit metadata.
 
 ### Phase 5 — Game Layer
 - Score, levels, black hole placement constraints, particle-budget challenges, campaign.
+
+---
+
+## Reference Docs
+
+- [`docs/render-pipeline.md`](render-pipeline.md) — what gets sent to the GPU, in what format, when. The whole render pass is one texture upload + one full-screen triangle. Read before touching anything GPU-side.
+- [`docs/performance-budget.md`](performance-budget.md) — concrete fps targets at every grid size on m5 vs the gaming rig, where the time goes per frame, and when to spec vs when to profile.
 
 ---
 
@@ -127,6 +136,11 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 | 2 | 2026-10-08 | Hand-rolled wgpu + Rust sim | Need fine control over grid layout, not Bevy's ECS. wgpu gives us GPU blit and future compute without locking us out. | Bevy (ECS mismatch), Unity DOTS (not "custom engine" feel), pure wgpu from scratch (year of yak-shaving). |
 | 3 | 2026-10-08 | Per-particle bonds, not chunks/meshes | This is the visual signature. Particles *evaporate*, not explode. | Voxel chunks (coarse), mesh with tensile strength (3D-style), pure PBD (no tearing model). |
 | 4 | 2026-10-08 | m5 as dev box, dGPU as target | m5 is integrated Radeon, can dev at low particle counts. Architecture keeps sim CPU-side, render a single blit — easy to retarget. | Optimizing for m5 specifically. |
+| 5 | 2026-10-08 | Phase 2: Verlet integration for bodies, Euler for particles | Bodies need long-term orbital stability (Verlet is symplectic — energy-conserving). Particles snap to grid cells, don't need it. | Pure Euler for everything (orbits decay visibly within seconds — bad UX). |
+| 6 | 2026-10-08 | Phase 2: bodies are part of the grid (Option A), not a separate render layer | Option A keeps the renderer simple (one texture upload, one draw call). Visual polish comes in Phase 4. | Option B (separate body layer) — second draw call, premature complexity for v0.1. |
+| 7 | 2026-10-08 | Phase 2: Plummer softening (ε² added to r²) for gravity | Prevents infinite acceleration on close encounters. Standard trick, ε=0.5 grid cells. | Hard cutoff (looks unnatural — bodies "skip" past each other). |
+| 8 | 2026-10-08 | Phase 3: Barnes-Hut on CPU, GPU compute deferred | Tree build is small (≤4000 nodes for 1000 bodies), rebuilds fast on CPU. Pushing tree traversal to GPU requires a full sim→GPU migration — Phase 4+ question. | GPU-only Barnes-Hut (premature optimization; complicates Phase 1/2). |
+| 9 | 2026-10-08 | Render uses one byte per cell (R8Unorm) + a 256-entry palette texture | Material fits in one byte; palette lookup is one shader instruction. Less bandwidth, simpler code. | Rgba8 for sim data (wastes 75% of bandwidth), per-material branch in fragment shader (GPU unfriendly). |
 
 ---
 
