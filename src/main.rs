@@ -1,6 +1,19 @@
-// Phase 0: stub. Phase 1 fills in the wgpu bootstrap, sim grid, and black hole.
+//! blackhole-sand — entry point.
+//!
+//! Phase 1: opens a wgpu window, runs the sim, lets the user click to place a
+//! planet and watch it get torn apart by the central black hole.
+
+mod app;
+mod material;
+mod sim;
+mod state;
+
+use winit::event_loop::EventLoop;
 
 fn main() {
-    println!("blackhole-sand v{}", env!("CARGO_PKG_VERSION"));
-    println!("Phase 0 stub. See docs/SPEC.md — Phase 1 will open a window.");
+    let event_loop = EventLoop::new().expect("create event loop");
+    let mut app = app::App::new();
+    event_loop
+        .run_app(&mut app)
+        .expect("event loop run");
 }
