@@ -123,6 +123,25 @@ For particles, Euler is fine — they don't need long-term orbital stability, th
 
 ---
 
+## Phase 1 → Phase 2 Transition: Sticky Bonds
+
+**Phase 1 had a simplification that Phase 2 must reverse:**
+
+Phase 1 rebuilds bond bitmasks from scratch every tick based on current adjacency. If two particles become adjacent, they bond. If they separate, they unbond. This was a sensible Phase 1 call for visual continuity — particles drifting near each other stayed glued.
+
+**Phase 2 needs sticky bonds:** once a bond breaks, it stays broken. New bonds only form when a particle is *first placed* (e.g. a planet is spawned). Otherwise, when a disintegrating planet's debris cloud passes through another body's gravity well, particles from different bodies re-bond into a Frankenstein planet, and the disintegration effect doesn't compound.
+
+**Implementation sketch:**
+- Add a `bond_state: u8` bitmask (4 bits) per cell, same encoding as the existing `bonds_n/e/ne/se` arrays but representing **lifetime bonds**.
+- On planet spawn: compute adjacency → set `bond_state` bits.
+- On every tick: compute `current_adjacency`, AND with `bond_state` to get *active* bonds.
+- When strain exceeds max-strain, clear the corresponding `bond_state` bit on **both** cells. Once cleared, it can never re-form.
+- The existing `bonds_n/e/ne/se` arrays in Phase 1 become the *output* of (state ∩ adjacency), not the source of truth.
+
+**Why this matters for the design:** the visual signature of Phase 2 — a planet losing mass to a black hole, becoming a debris stream — requires bonds that stay broken. Auto-rebonding inverts the effect: the planet heals as it falls.
+
+---
+
 ## Phase 2 Acceptance Criteria
 
 When Phase 2 lands, the user can:
