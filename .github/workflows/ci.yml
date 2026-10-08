@@ -27,6 +27,13 @@ jobs:
       - name: Assert docs/SPEC.md has a Decisions log
         run: grep -q "Decisions Log" docs/SPEC.md
 
+      - name: Assert reference docs exist
+        run: |
+          test -f docs/phase-2-multi-body-gravity.md
+          test -f docs/phase-3-barnes-hut.md
+          test -f docs/render-pipeline.md
+          test -f docs/performance-budget.md
+
       - name: Assert HANDOFF.md has the session-log header
         run: grep -q "Handoff Log" HANDOFF.md
 
