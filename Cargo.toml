@@ -1,0 +1,16 @@
+[package]
+name = "blackhole-sand"
+version = "0.1.0"
+edition = "2021"
+description = "2D particle-physics engine for space — black holes rip celestial bodies apart particle by particle"
+license = "TBD"
+
+[dependencies]
+wgpu = "22.1"
+winit = "0.30"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "0.3"
+
+[[bin]]
+name = "blackhole-sand"
+path = "src/main.rs"

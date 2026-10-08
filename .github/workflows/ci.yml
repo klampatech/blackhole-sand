@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  spec-canonical:
+    name: Spec layout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert docs/SPEC.md exists
+        run: test -f docs/SPEC.md
+
+      - name: Assert SPEC.md exists and points at docs/SPEC.md
+        run: |
+          test -f SPEC.md
+          grep -q "docs/SPEC.md" SPEC.md
+
+      - name: Assert docs/SPEC.md declares itself canonical
+        run: grep -q "Canonical source of truth" docs/SPEC.md
+
+      - name: Assert docs/SPEC.md has a Decisions log
+        run: grep -q "Decisions Log" docs/SPEC.md
+
+      - name: Assert HANDOFF.md has the session-log header
+        run: grep -q "Handoff Log" HANDOFF.md
+
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets
