@@ -196,6 +196,93 @@ impl World {
         id
     }
 
+    /// Spawn a planet body at `(cx, cy)` with a tangential velocity
+    /// `v_circ = sqrt(G * M_BH / r)` around the first BlackHole in the
+    /// world, plus an equal-and-opposite recoil on the BH so the
+    /// initial system momentum is approximately 0 (COM-stationary
+    /// init; see decision #19 and the default scenario).
+    ///
+    /// This is the click-spawn entry point: it makes click-spawned
+    /// planets behave the same as the default-scenario planet, so
+    /// the user sees a circular orbit instead of the planet falling
+    /// straight into the BH with v=(0,0).
+    ///
+    /// Returns `None` if:
+    ///   * there is no BlackHole in the world (nothing to orbit),
+    ///   * the click point is essentially on top of the BH (r near 0;
+    ///     v_circ would blow up),
+    ///   * the material does not support bonds (`spawn_planet` returns
+    ///     `NO_BODY`),
+    ///   * the click footprint is fully occupied (planet spawns with
+    ///     zero particles, so zero mass, which would NaN in the
+    ///     integrator).
+    pub fn spawn_planet_in_orbit(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        mat: u8,
+    ) -> Option<u32> {
+        // Find the first BlackHole body. (When multiple BHs are
+        // present we do not yet pick "nearest" — click-spawn in this
+        // project is overwhelmingly tested with the default
+        // single-BH scenario, so the simplest "first wins" rule is
+        // good enough for now.)
+        let bh_idx = self
+            .bodies
+            .iter()
+            .position(|b| matches!(b.kind, crate::body::BodyKind::BlackHole))?;
+        let (bh_pos, bh_mass) =
+            (self.bodies[bh_idx].position, self.bodies[bh_idx].mass);
+
+        // Radial vector from BH to click point.
+        let dx = cx as f32 - bh_pos.x;
+        let dy = cy as f32 - bh_pos.y;
+        let r = (dx * dx + dy * dy).sqrt();
+        if r < 1.0 {
+            return None;
+        }
+
+        // v_circ = sqrt(G * M_BH / r); tangential direction is the CCW
+        // perpendicular of the radial vector: (-dy, dx) / r.
+        let v_circ = (G * bh_mass / r).sqrt();
+        let tx = -dy / r;
+        let ty = dx / r;
+
+        // Spawn the planet body in place (same path as the CLI/JSON
+        // scenarios). Bail if the spawn refused (no bonds, footprint
+        // occupied, etc.).
+        let pid = self.spawn_planet(cx, cy, radius, mat);
+        if pid == NO_BODY as u32 {
+            return None;
+        }
+        // Bail if no particles actually landed — planet mass would be
+        // 0 and the integrator would NaN on its first step.
+        let planet_mass = self
+            .bodies
+            .iter()
+            .find(|b| b.id == pid)
+            .map(|b| b.mass)
+            .unwrap_or(0.0);
+        if planet_mass <= 0.0 {
+            return None;
+        }
+
+        // Tangential velocity on the planet.
+        if let Some(p) = self.bodies.iter_mut().find(|b| b.id == pid) {
+            p.velocity = crate::body::Vec2::new(v_circ * tx, v_circ * ty);
+        }
+
+        // Equal-and-opposite recoil on the BH so the system COM
+        // starts stationary (decision #19, same as default scenario).
+        // dv_BH = -(m_planet / m_BH) * v_planet.
+        let recoil_mag = v_circ * planet_mass / bh_mass;
+        self.bodies[bh_idx].velocity -=
+            crate::body::Vec2::new(recoil_mag * tx, recoil_mag * ty);
+
+        Some(pid)
+    }
+
     /// Spawn a BlackHole at the given position with the given mass. The
     /// BlackHole owns no particles and has no bonds; it is just a
     /// gravitational source plus a tiny disk of `EventHorizon`-colored
@@ -1497,5 +1584,111 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn spawn_planet_in_orbit_uses_v_circ_and_recoil() {
+        // Click-spawn now initializes the new planet on a tangential
+        // circular orbit around the first BH and applies
+        // equal-and-opposite recoil to the BH so the system COM
+        // starts stationary (matching the default scenario —
+        // decision #19). Three invariants to check:
+        //
+        //   1. Planet velocity is tangential to the radial
+        //      BH -> planet vector (CCW) with magnitude
+        //      v_circ = sqrt(G * M_BH / r).
+        //   2. BH velocity has equal-and-opposite recoil along
+        //      the planet's velocity axis.
+        //   3. Total system momentum is approximately 0.
+        let mut w = World::new();
+        let bh_id = w.spawn_black_hole(128.0, 128.0, 1000.0);
+        let pid = w
+            .spawn_planet_in_orbit(178, 128, 6, Material::Rock as u8)
+            .expect("spawn_planet_in_orbit should return Some");
+
+        let planet = w.bodies.iter().find(|b| b.id == pid).unwrap().clone();
+        let bh = w.bodies.iter().find(|b| b.id == bh_id).unwrap().clone();
+
+        // Invariant 1: tangential velocity with magnitude v_circ.
+        let dx = planet.position.x - bh.position.x;
+        let dy = planet.position.y - bh.position.y;
+        let r = (dx * dx + dy * dy).sqrt();
+        assert!(
+            (r - 50.0).abs() < 1.0,
+            "expected r ~ 50 from BH at (128,128) to click at (178,128), got r = {r:.3}"
+        );
+        // CCW perpendicular of (dx, dy) is (-dy, dx) / r. The
+        // planet should have its full velocity along this direction
+        // (zero radial component).
+        let rad_hat = glam::Vec2::new(dx / r, dy / r);
+        let tang_hat = glam::Vec2::new(-dy / r, dx / r);
+        let v_radial = planet.velocity.dot(rad_hat);
+        let v_tang = planet.velocity.dot(tang_hat);
+        assert!(
+            v_radial.abs() < 1e-3,
+            "planet velocity should be purely tangential, got radial component \
+             {v_radial:.3} (v = {:?})",
+            planet.velocity
+        );
+        assert!(
+            v_tang > 0.0,
+            "planet should orbit CCW (positive tangential), got v_tang = {v_tang:.3}"
+        );
+        let v_circ_expected = (G * 1000.0 / r).sqrt();
+        assert!(
+            (v_tang - v_circ_expected).abs() < 1e-3,
+            "planet speed should be v_circ = sqrt(G*M_BH/r) = {v_circ_expected:.3}, \
+             got {v_tang:.3}"
+        );
+
+        // Invariant 2: BH recoil is opposite to the planet's
+        // velocity direction.
+        let bh_dot_planet = bh.velocity.dot(planet.velocity);
+        assert!(
+            bh_dot_planet < 0.0,
+            "BH velocity should be opposite to planet velocity, got \
+             bh={:?} planet={:?}",
+            bh.velocity,
+            planet.velocity
+        );
+
+        // Invariant 3: total system momentum is approximately 0
+        // (COM-stationary init, same as the default scenario).
+        let total_p: glam::Vec2 = w.bodies.iter().map(|b| b.mass * b.velocity).sum();
+        assert!(
+            total_p.length() < 1e-3,
+            "total system momentum should be ~0 after click-spawn, got {total_p:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_in_orbit_returns_none_without_black_hole() {
+        // No BH -> no orbital reference. The click-spawn should
+        // refuse rather than spawn a free-falling planet at v=0.
+        let mut w = World::new();
+        let result = w.spawn_planet_in_orbit(100, 100, 5, Material::Rock as u8);
+        assert!(
+            result.is_none(),
+            "spawn_planet_in_orbit should return None when no BH exists"
+        );
+        assert!(
+            w.bodies.is_empty(),
+            "no bodies should have been spawned when BH is missing"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_in_orbit_returns_none_on_top_of_bh() {
+        // Click on the BH itself -> r ~ 0 -> v_circ blows up. The
+        // spawn must refuse rather than inject a NaN velocity.
+        let mut w = World::new();
+        w.spawn_black_hole(128.0, 128.0, 1000.0);
+        let result = w.spawn_planet_in_orbit(128, 128, 5, Material::Rock as u8);
+        assert!(
+            result.is_none(),
+            "spawn_planet_in_orbit should return None when click is on BH"
+        );
+        // Only the BH should be in the world.
+        assert_eq!(w.bodies.len(), 1);
+    }
 
 }

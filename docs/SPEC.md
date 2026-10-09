@@ -499,6 +499,65 @@ fix.
 
 ## Session Log
 
+### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
+
+User feedback from the Session 7 MacBook playtest: clicking spawned a
+planet at the cursor with `v=(0,0)`, which then fell straight into
+the BH instead of orbiting — confusing because the default scenario
+clearly *does* orbit. Two options on the table: disable click-spawn
+or align it with the default scenario's physics. User picked the
+latter so the playtest surface stays the same and so we get a free
+UX win out of the existing code.
+
+New method `World::spawn_planet_in_orbit(cx, cy, radius, mat) ->
+Option<u32>` in `src/sim.rs`. It finds the first BlackHole in the
+world, computes the radial vector from BH to click point, returns
+`None` when `r < 1.0` (click on top of BH — `v_circ` would blow
+up), then calls the existing `spawn_planet` and applies:
+
+- `v_planet = v_circ · (−dy, dx) / r` — the CCW tangential
+  perpendicular of the radial vector (same direction the default
+  scenario uses at its +x starting position).
+- `Δv_BH = −(m_planet / m_BH) · v_planet` — equal-and-opposite
+  recoil so the system COM starts stationary (decision #19).
+
+Returns `None` if there is no BH, the click is on the BH, the
+material has no bonds, or the spawn footprint is fully occupied.
+`App::spawn_planet_at_cursor` in `src/app.rs` now calls the new
+method instead of `spawn_planet` directly.
+
+Tests added (3, all in `sim::tests`):
+
+- `spawn_planet_in_orbit_uses_v_circ_and_recoil` — the canonical
+  check: planet velocity is purely tangential with magnitude
+  `v_circ = sqrt(G*M_BH/r)`, BH recoil is opposite to planet
+  velocity, total system momentum is approximately 0.
+- `spawn_planet_in_orbit_returns_none_without_black_hole` — no
+  BH means nothing to orbit; no body should be spawned.
+- `spawn_planet_in_orbit_returns_none_on_top_of_bh` — click on
+  the BH itself returns `None` rather than injecting a NaN
+  velocity.
+
+Verification: 39 tests pass (was 36, +3), 3 ignored. Default-scenario
+dump at t=0/40/120/240/400/800 ticks is byte-for-byte identical to
+the Phase 2/Phase 3 baseline (BH at (136.73, 124.97) at t=400,
+planet at (78.8, 141.9) with mass 54) — the click-spawn path is
+not on the default scenario's hot path so the integration
+regression test stays green.
+
+Decision #28 added (click-spawn = tangential circular orbit + BH
+recoil, "first BH wins" for multi-BH scenes).
+
+**Playtest status:** the new method compiles clean and passes unit
+tests, but the user has not yet re-run the MacBook visual playtest
+of click-spawn. That's the next step: `cargo run`, click anywhere
+off-center, and confirm the planet now orbits the BH instead of
+free-falling.
+
+**Next up:** user confirms the visual; PR #5 picks up the new
+commit; Phase 4 (bodies as first-class objects with shape
+templates) remains the next major chunk of work.
+
 ### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
 
 Built the Barnes-Hut quadtree path for body-particle gravity and
@@ -762,4 +821,5 @@ of the speculative "~34" framing.
 | 25 | 2026-10-09 | Phase 3: Barnes-Hut tree is rebuilt every tick, not incrementally | Bodies move every tick (Leapfrog integrates them) and the cost of incrementally updating the tree is on par with rebuilding from scratch at our scale (N ≤ 1000, max tree size 4N = 4000 nodes, build is O(N log N) = 10000 ops). Rebuilding simplifies the code: the tree is a snapshot of `self.bodies` at the start of `move_pass`, used by every cell, and dropped at the end of the tick. No parent tracking, no rebalancing, no stale-node bugs. | Incremental update (re-builds of subtrees when a body crosses a quadrant boundary; at our scale the bookkeeping cost exceeds the savings), periodic rebuild (rebuild every K ticks: introduces a staler-tree error budget we'd then have to reason about; simpler to just rebuild every tick). |
 | 26 | 2026-10-09 | Phase 3: body-body gravity stays N² pairwise | N bodies is bounded by Phase 4's body templates, so N² body-body gravity is at most 100×100 = 10,000 ops/tick — nothing. The Barnes-Hut tree is for body-particle gravity (which is N×M for N bodies and M particles, and M can be 50k+). | Apply Barnes-Hut to body-body too (the N² cost is 4 orders of magnitude below body-particle; would just add branching and reduce clarity). |
 | 27 | 2026-10-09 | Phase 3: Barnes-Hut tree uses Plummer softening identical to Phase 2 (`d² -> d² + SOFTENING_SQ = d² + 0.25`) | Consistency with the Phase 2 spec. The softening goes into the magnitude (`a_mag = G * M / d²` uses the softened `d²`) but the opening-angle test uses the unsoftened distance so it matches the textbook Barnes-Hut criterion. The visual signature of close encounters is preserved because softening is what keeps the per-cell gravity vector from blowing up near a body. | Hard cutoff (looks unnatural; bodies "skip" past each other — same as Phase 2's rejected option for direct sum), no softening in the tree (numerical instability when two bodies are very close: their CoM is in the same cell and the softened magnitude still overflows). |
+| 28 | 2026-10-09 | Phase 3: click-spawned planets are initialized on a tangential circular orbit around the first BlackHole (`v_circ = sqrt(G * M_BH / r)`, CCW perpendicular to the radial vector), with equal-and-opposite recoil on the BH so the system starts COM-stationary | Phase 1/2 click-spawn used `spawn_planet(cx, cy, ...)` which left the planet at v=(0,0); on the MacBook playtest the user saw the planet fall straight into the BH instead of orbiting — confusing because the default scenario clearly does orbit. Aligning click-spawn with the default scenario (decision #19 + decision #20) means the click-to-orbit interaction matches what the playtest expects. The “first BH wins” rule is good enough because click-spawn is overwhelmingly tested with the single-BH default scenario; if multi-BH scenes become a thing we can revisit with “nearest BH”. Returns `None` when there is no BH, the click is on top of a BH (r near 0), or the spawn footprint is fully occupied. | Disable click-spawn (it’s the visible interaction, disabling would lose user-visible behavior for a UX miss), keep `spawn_planet` and accept the v=0 free-fall (the bug we’re fixing), pick the *nearest* BH (more intuitive for multi-BH scenes but adds bookkeeping for a case we don’t exercise yet). |
 > **Status:** Phase 3 (Barnes-Hut) landed on `feat/phase-3-barnes-hut` (commits `e0409b0` + this commit). PR + review pending.

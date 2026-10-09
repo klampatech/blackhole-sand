@@ -20,6 +20,33 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 ## Log
 
 
+### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
+
+- User playtest feedback: click-spawned planets fell straight into
+  the BH (they spawned with `v=(0,0)`), which was confusing because
+  the default scenario clearly orbits. User picked "align
+  click-spawn with default-scenario physics" over "disable
+  click-spawn".
+- New `World::spawn_planet_in_orbit(cx, cy, radius, mat) ->
+  Option<u32>` in `src/sim.rs`: finds the first BlackHole, computes
+  the radial vector, returns `None` on `r < 1.0`, then spawns the
+  planet via the existing `spawn_planet` and applies
+  `v_planet = v_circ · (−dy, dx) / r` (CCW tangential) plus
+  `Δv_BH = −(m_planet / m_BH) · v_planet` (COM-stationary
+  recoil, decision #19). `App::spawn_planet_at_cursor` now calls
+  this. Three new tests in `sim::tests`: tangential velocity + recoil
+  + zero system momentum, `None` without BH, `None` on top of BH.
+- Decision #28 added (click-spawn = tangential circular orbit +
+  BH recoil, "first BH wins" for multi-BH scenes). Session 8 entry
+  added to `docs/SPEC.md` and this file.
+- 39 tests pass (was 36, +3), 3 ignored. Default-scenario dump is
+  byte-for-byte identical to the Phase 2/3 baseline
+  (BH=(136.73, 124.97) at t=400). `cargo build` is warning-clean.
+- **Playtest status:** code compiles and the new unit tests pass,
+  but the user has not yet re-run the MacBook visual playtest of
+  click-spawn. Next step is `cargo run` and clicking anywhere
+  off-center to confirm the planet now orbits the BH.
+
 ### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
 
 - New module `src/barnes_hut.rs` (flat `Vec<QuadNode>` quadtree,
