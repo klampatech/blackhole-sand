@@ -311,6 +311,179 @@ into a tutorial later.
 
 ---
 
+## Phase 3 implementation notes
+
+- **Tree layout:** flat `Vec<QuadNode>`, child pointers are
+  indices into the parent vec (not `Box<QuadNode>`). Cache-
+  friendly traversal, no pointer chasing. For N bodies the
+  max tree size is 4N nodes.
+- **θ = 0.5** (decision #23). The opening-angle test uses
+  unsoftened `d²` (matches the textbook Barnes-Hut criterion);
+  Plummer softening ε=0.5 goes into the magnitude only. Single-
+  body leaves short-circuit the test (their d=0 would make
+  s/d = ∞, which is wrong).
+- **Threshold = 8 bodies** (decision #24). Below this, direct
+  sum wins on a constant-factor basis (tree build + traversal
+  overhead exceeds the O(N) saving for small N). Direct sum is
+  correct for all N; Barnes-Hut is just faster above the
+  threshold. The exact crossover point should be tuned against
+  the `perf_sanity_*` tests on real hardware.
+- **Rebuild every tick** (decision #25). No incremental updates.
+  Bodies move every tick; the bookkeeping for an incremental
+  tree is more code than the rebuild saves at this scale.
+- **MAX_DEPTH = 64** is the degenerate-input backstop. If many
+  bodies land in the same cell (or sub-cell), the `MergeHere`
+  path treats the leaf as a multi-body aggregate and stops
+  subdividing. The CoM is recomputed as the mass-weighted
+  average; the multi-body leaf is then traversed like any other
+  internal node (the s/d test still applies at MAX_DEPTH).
+- **Body-body gravity stays N² pairwise** (decision #26). The
+  Barnes-Hut path is only for body-particle gravity (the
+  per-cell acceleration in `move_pass`). Body-body N² is fine
+  because the body count is bounded by Phase 4 templates.
+- **Event horizon + Newton's 3rd law** (decisions #22) are
+  orthogonal to Barnes-Hut and stay unchanged. The momentum
+  transfer at the event horizon is applied per-particle; the
+  Barnes-Hut tree only sees body positions, not particles.
+- **Body-particle position alignment** (PR #4 review item 1):
+  `apply_scenario` rounds `(x, y)` once and uses the rounded
+  value for both the particle disk spawn AND the body position.
+  Default scenario uses integer coords and is unaffected; only
+  non-integer CLI specs like `planet:x=180.5,...` triggered
+  the bug. Resolved in commit `e0409b0` (Session 6).
+
+---
+
+## Phase 3 follow-ups (from PR #5 review)
+
+These are issues the PR #5 review caught but didn't block on.
+They should land as a single follow-up commit on
+`feat/phase-3-barnes-hut` (or on a new branch off the merged
+main) before Phase 4 work begins.
+
+### 1. SPEC Session 7 perf table is off by ~10% [nit]
+
+`docs/SPEC.md:329-` (Session 7 entry) shows the perf table as:
+
+| Scenario | ms/tick (release, dev box) | Budget |
+|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a |
+| 10 BHs + 65k particles (Barnes-Hut) | **7.4** | < 33 |
+| 100 BHs + 63k particles (Barnes-Hut) | **15.2** | < 33 |
+
+Actual measured values (this dev box, release, after warmup):
+
+| Scenario | ms/tick (release, dev box) | Budget |
+|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a |
+| 10 BHs + 65k particles (Barnes-Hut) | **6.6** | < 33 |
+| 100 BHs + 63k particles (Barnes-Hut) | **15.7** | < 33 |
+
+The 10-body number is ~10% off (likely warmup cost on the
+PR's first run); the 100-body number is in the noise. Real
+numbers are 6.6 / 15.7 ms/tick — both well under budget.
+
+**Fix:** update the SPEC table to 6.6 / 15.7, and add a note
+that perf is measured on `this dev box` (which is m5 or
+wherever the test ran); the gaming rig column is TBD per
+`docs/performance-budget.md`.
+
+### 2. SPEC Session 7 dump-test wording is slightly misleading [nit]
+
+Session 7 says: *"Default-scenario dump at t=0/40/120/240/
+400/800 ticks matches the Phase 2 baseline to the digit."*
+
+But the dump test on the Phase 3 branch now also dumps t=800,
+which the Phase 2 baseline never had. The byte-for-byte
+identity only holds for the 4 shared checkpoints
+(t=0/40/120/240/400).
+
+**Fix:** rephrase to: *"The shared checkpoints (t=0/40/120/
+240/400) match the Phase 2 baseline to the digit; t=800 is a
+new checkpoint with mass=23."*
+
+### 3. `BARNES_HUT_THETA = 0.5` doc claims a "test sweep" that doesn't exist [nit]
+
+`src/sim.rs:34-37` says: *"The spec calls for 0.5; the test
+sweep is in `barnes_hut::tests`."*
+
+No sweep test exists — only `bh_matches_direct_sum_with_small_
+theta` (θ=0.1, exact answer) and `bh_at_root_treats_as_point_
+mass_with_high_theta` (θ=100, root-only collapse). The
+production θ=0.5 is asserted by the equivalence test
+`barnes_hut_matches_direct_sum_for_8_bodies` (5% tolerance),
+not by a sweep.
+
+**Fix:** either remove the "test sweep" claim, or add a sweep
+test that picks θ=0.3 / 0.5 / 0.7 and shows the speed/
+accuracy tradeoff (the sweep is the kind of data the user
+will want to see when tuning for real hardware).
+
+### 4. Loose perf assert in `perf_sanity_100_bodies_50k_particles` [nit]
+
+`src/sim.rs:1412-1415` allows `ms_per_tick < 200.0` for the
+100-body case. Phase 3 budget is 33 ms/tick; the test allows
+~6x slack. Fine for CI but means a 50% perf regression would
+still pass.
+
+**Fix:** tighten to `< 100.0` (m5 budget) or `< 67.0` (gaming
+rig m5 budget). Real numbers are 15.7 ms/tick so either bound
+is well above the actual perf.
+
+### 5. No stress test for the MAX_DEPTH `MergeHere` path [nit]
+
+`src/barnes_hut.rs:97` says "64 is far more than enough for any
+reasonable N" but for 1000 bodies at 8-deep subdivision you
+already have `4^8 = 65536` nodes. With MAX_DEPTH=64 you can hit
+a corner case where many bodies cluster in the same cell and
+the tree's `MergeHere` path swallows the cluster into a single
+multi-body leaf.
+
+This is documented and correct, but the test suite doesn't
+exercise it. Add a test: `merge_many_bodies_same_cell_does_not_
+explode` that places 1000 bodies in the same cell, builds the
+tree, and verifies the tree depth is bounded by MAX_DEPTH and
+the CoM/total_mass match the mass-weighted average of the
+bodies.
+
+### 6. Threshold boundary perf measurement is missing [nit]
+
+`sim.rs:34-44` says "below the threshold direct sum wins on a
+constant-factor basis" — but no perf test verifies this at the
+boundary. The threshold is set to 8 based on intuition, not
+measurement.
+
+**Fix:** add a `#[ignore]`'d `perf_sanity_threshold_boundary`
+test that runs the same scenario at N=4, 6, 8, 10, 12 bodies
+and prints ms/tick for each. The crossover (where BH becomes
+faster than direct sum) should be near 8; if it's actually
+at 4 or at 12, the threshold constant should move.
+
+### 7. `dump_default_scenario` comment still says "Phase 2 default scenario" [nit]
+
+`src/sim.rs::dump_default_scenario` doc comment says
+"Visual smoke test for the Phase 2 default scenario" — should
+say "Phase 2/3 default scenario" or "Phase 2 default scenario,
+also used as the Barnes-Hut identity test." Cosmetic, but
+keeps the docs honest about which phase each test belongs to.
+
+### 8. `MergeHere` path needs a clarifying comment [nit]
+
+`src/barnes_hut.rs:182-197` clears `body_id = None` but does
+not clear `center_of_mass` or `total_mass` to indicate the
+node is now a multi-body aggregate. The math is correct (the
+new CoM is the mass-weighted average of the existing + new
+bodies; total_mass is the sum), but the conceptual mismatch
+between `body_id = None` (multi-body) and `center_of_mass`
+(point mass at the body's position) is briefly confusing.
+
+**Fix:** add a one-line comment after `body_id = None`:
+`// now a multi-body leaf — body_id cleared, CoM/mass
+recomputed above.` The math is right; this is a readability
+fix.
+
+---
+
 ## Acceptance Criteria (per phase)
 
 | Phase | Status | What the user can do when done |
@@ -387,8 +560,6 @@ small far-field error and the default scenario has only 2 bodies
 (no tree to walk). At 8+ bodies the per-cell gravity vector is
 within 5% of the direct sum, which is well below the threshold
 where the "tidal peel" would visibly smooth out.
-
-### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
 
 ### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
 
