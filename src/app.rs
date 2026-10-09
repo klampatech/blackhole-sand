@@ -1,15 +1,25 @@
 //! winit ApplicationHandler. Owns the wgpu `State` and the sim `World`.
 //!
-//! Input mapping:
-//!   * Left-click  — spawn a Rock planet at the cursor (grid space).
-//!   * Right-click — clear all particles.
+//! ## Body construction
+//!
+//! Phase 2: App::new accepts an optional scenario. When supplied, the
+//! bodies from the scenario replace the default. When not, we use the
+//! default scenario (1 BH at grid center + 1 planet on a near-collision
+//! orbit) and also seed a thin rain of particles so the user sees the
+//! falling-sand effect.
+//!
+//! ## Input mapping (Phase 2)
+//!   * Left-click  — spawn a new Rock planet at the cursor (added to the
+//!                   sim, not replacing existing bodies).
+//!   * Right-click — clear all particles AND bodies.
 //!   * Window resize — reconfigure the swap chain.
 //!   * Close / Cmd-Q — quit.
 
 use std::sync::Arc;
 
 use crate::material::Material;
-use crate::sim::{H, W, World};
+use crate::scenario::{self, BodySpec};
+use crate::sim::{World, H, W};
 use crate::state::State;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
@@ -30,9 +40,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    /// Build the app. If `scenario` is `Some`, use those body specs.
+    /// If `None`, build the default scenario (1 BH + 1 planet) and
+    /// additionally seed a thin rain of particles so the falling-sand
+    /// effect is visible at startup.
+    pub fn new(scenario: Option<&[BodySpec]>) -> Self {
         let mut world = World::new();
-        world.seed_rain();
+        match scenario {
+            Some(specs) => scenario::apply_scenario(&mut world, specs),
+            None => {
+                scenario::default_scenario(&mut world);
+                world.seed_rain();
+            }
+        }
         Self {
             state: None,
             world,
@@ -47,8 +67,6 @@ impl App {
         if win.width == 0 || win.height == 0 {
             return None;
         }
-        // The sim grid is square. Fit it inside the window with letterboxing
-        // (preserving aspect ratio) so it doesn't stretch.
         let (sx, sy) = if win.width <= win.height {
             let scale = win.width as f64 / W as f64;
             let used_h = scale * H as f64;
