@@ -20,6 +20,52 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 ## Log
 
 
+### 2026-10-08 — Session 4: Phase 2 hardening (BH-zoom playtest fix)
+
+- Three real bugs were behind the MacBook "BH zooms around" report
+  from the default-scenario playtest: (1) `move_pass` silently lost
+  particles when two converged on the same cell (up to 84 of 113 in
+  the default scenario by t=200) because `find_target` only checked
+  the *original* grid, not the in-progress `claim` array; (2) a
+  Frankenstein integrator (Forward Euler on velocity, Verlet on
+  position) was gaining energy and spiraling orbits outward; (3) the
+  default scenario's near-collision orbit was throwing the planet
+  off the grid where its pinned mass dragged the BH around. All
+  three fixed: pass `claim` into `find_target`, switch to a proper
+  KDK leapfrog, and replace the default with a circular orbit at
+  r=50 with COM-stationary initial velocities.
+- New tests: `move_pass_does_not_lose_particles`,
+  `leapfrog_does_not_gain_energy_in_pure_orbit`,
+  `body_body_gravity_conserves_momentum`. 27 pass, 2 ignored.
+- **Playtest status:** T3 Code verified the BH stays near grid
+  center and the planet completes a circular orbit; the user
+  confirmed the playtest on the m5. Perf sanity (10 BHs + 65k
+  particles) is 3.3 ms/tick — within budget.
+- **Next up:** open PR #4 for review; pick up the remaining
+  Newton's-3rd-law event-horizon hole in a follow-up.
+
+### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
+
+- Closed the last Phase 2 hole flagged in Session 4: particles
+  consumed at the BH's event horizon used to vanish with their
+  momentum, leaving the BH to retain its pre-consumption velocity
+  and breaking conservation of total system momentum. The COM-
+  stationary default init hid the symptom; head-on / off-COM
+  configs would have shown the BH lurching.
+- `apply_event_horizons` now applies `Δv_BH = v_particle / M_BH`
+  per consumed particle (v_particle ≈ owning planet body velocity).
+  Recoil is accumulated per BH in a small `Vec` and applied at the
+  end of the destruction loop to avoid borrow conflicts with the
+  per-planet `particle_budget` decrement. Decision #22 added.
+- New test `event_horizon_conserves_total_momentum` runs the
+  COM-stationary default to consumption: total system momentum
+  stays ≤ 5 mass-units*cells/tick end-to-end, and the BH ends up
+  with |v| ≤ 0.1 cells/tick (its initial recoil has been cancelled
+  by the absorbed planet momentum). 28 pass, 2 ignored.
+- **Playtest status:** dump at t=400 shows BH velocity dropped
+  from initial (0, -0.045) to (0.005, 0.017) — nearly stationary
+  at the COM, as the math predicts. Perf sanity 3.41 ms/tick.
+
 ### 2026-10-08 — Session 3: Phase 2 ships
 
 - Phase 2 build complete on branch `feat/phase-2-multi-body-gravity`

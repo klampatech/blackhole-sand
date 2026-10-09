@@ -4,9 +4,9 @@
 //!
 //! Phase 2: App::new accepts an optional scenario. When supplied, the
 //! bodies from the scenario replace the default. When not, we use the
-//! default scenario (1 BH at grid center + 1 planet on a near-collision
-//! orbit) and also seed a thin rain of particles so the user sees the
-//! falling-sand effect.
+//! default scenario (1 BH at grid center + 1 planet on a circular
+//! orbit, COM-stationary init — see SPEC decision #20) and also seed
+//! a thin rain of particles so the user sees the falling-sand effect.
 //!
 //! ## Input mapping (Phase 2)
 //!   * Left-click  — spawn a new Rock planet at the cursor (added to the

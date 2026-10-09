@@ -2,7 +2,7 @@
 
 **Canonical source of truth: this file.** The vault is a one-way mirror (if/when we create one); this is authoritative. Edit on a branch + PR. No direct-to-main pushes.
 
-> **Status:** Phase 2 landed on branch `feat/phase-2-multi-body-gravity`. Awaiting PR + review.
+> **Status:** Phase 2 merged on main (PR #4, `22cfc23`). Phase 3 (Barnes-Hut) in progress on `feat/phase-3-barnes-hut`.
 
 ---
 
@@ -198,9 +198,10 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 
 ## Phase 2 follow-ups (from PR #4 review)
 
-These are issues the PR review caught but didn't block on. They should
-land as small follow-up commits on `feat/phase-2-multi-body-gravity`
-(or on a new branch off the merged main) before Phase 3 work begins.
+These were issues the PR #4 review caught but didn't block on. They
+landed as a single cleanup commit on `feat/phase-3-barnes-hut` (see
+Session 6) before Phase 3 work began. The list is preserved here as
+a record of what was fixed.
 
 ### 1. Body-particle position alignment on CLI spawn [BLOCKER]
 
@@ -325,6 +326,50 @@ into a tutorial later.
 
 ## Session Log
 
+### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
+
+Landed the 9 follow-up items from the PR #4 review as a single
+cleanup commit on `feat/phase-3-barnes-hut` (immediately after
+branching from main, before Barnes-Hut work). One real bug, eight
+documentation/test nits. The whole list is preserved under
+"Phase 2 follow-ups (from PR #4 review)" with each item marked
+**Resolved (Session 6)** so the trail is auditable.
+
+Changes:
+
+- **Follow-up #1 (BLOCKER):** `apply_scenario` now rounds `(x, y)`
+  once and uses the rounded value for BOTH the particle disk
+  spawn and the body position. A non-integer CLI spec like
+  `planet:x=180.5,...` no longer leaves the body 0.5 cells off
+  center from its own mass. New test
+  `apply_scenario_rounds_body_position_to_particle_disk` guards
+  the regression.
+- **Follow-up #2:** `default_scenario` docstring now uses r=50
+  throughout (was r=40 in the math, r=50 in the code).
+- **Follow-up #3:** `app.rs` module docstring no longer calls the
+  default a "near-collision orbit" — it's a circular orbit with
+  COM-stationary init (decision #20).
+- **Follow-up #4:** SPEC Session 4 now reads "27 tests pass (was
+  24, +3), 2 ignored" (was incorrectly "30 tests pass").
+- **Follow-up #5:** `move_pass_does_not_lose_particles` test
+  comment now cites the commit message's measured 84-of-113
+  figure (was the speculative ~62).
+- **Follow-up #6:** `HANDOFF.md` now has Session 4 (BH-zoom fix)
+  AND Session 5 (Newton's 3rd law) entries consistent with the
+  SPEC session log.
+- **Follow-up #7:** Removed unused import `crate::body::Body`
+  and unused `initial_distance_sq` variable in the orbit test.
+  `cargo test` is warning-clean.
+- **Follow-up #8:** Deleted the vestigial comment in
+  `src/body.rs:11` (nothing referenced it).
+- **Follow-up #9:** `dump_default_scenario` now extends to t=800
+  (was t=400). SPEC Session 4 cites the measured end-of-run mass
+  instead of the speculative "~34" framing.
+
+Verification: 29 tests pass (was 28, +1), 2 ignored. No new
+decisions; the cleanup closes items the PR review caught and
+clears the path for Phase 3 (Barnes-Hut) work.
+
 ### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
 
 User confirmed the MacBook playtest of the Session 4 fix looks correct
@@ -396,15 +441,28 @@ planet on their MacBook. Three real bugs behind it:
 
 Tests added: `move_pass_does_not_lose_particles`,
 `leapfrog_does_not_gain_energy_in_pure_orbit`,
-`body_body_gravity_conserves_momentum`. **30 tests pass**, 2 ignored
-(visual dump + perf sanity).
+`body_body_gravity_conserves_momentum`. **27 tests pass** (was 24, +3),
+2 ignored (visual dump + perf sanity).
 
 Default scenario now: BH at (128, 128), mass=1000, v=(0, -0.045) (COM
 recoil); planet at (178, 128) on circular orbit r=50 with v=v_circ.
 COM stays at (133, 128); BH orbits the COM at radius 4 cells in a
-tight circle, which reads as "stationary" in the visual. Planet mass
-drops from 113 → ~34 over 800 ticks of tidal stripping but does not
-fully vanish.
+tight circle, which reads as "stationary" in the visual.
+
+Measured planet mass over time (from `dump_default_scenario` in
+`src/sim.rs`, release build, G=8e-3, M_BH=1000):
+
+| t (ticks) | planet mass |
+|---|---|
+| 0   | 113 |
+| 120 | 106 |
+| 240 | 82  |
+| 400 | 54  |
+| 800 | 23  |
+
+The planet does not fully vanish within 800 ticks; it loses
+roughly 8 particles per 100 ticks under the default orbital
+geometry.
 
 ### 2026-10-08 — Session 3: Phase 2 ships on `feat/phase-2-multi-body-gravity`
 
@@ -443,3 +501,24 @@ fully vanish.
 - Created repo at `~/Development/blackhole-sand/`, GitHub remote `klampatech/blackhole-sand`.
 - Wrote this SPEC, CI guard, HANDOFF stub.
 - Next: Phase 1 — wgpu window, single black hole, particle-by-particle disintegration.
+**Resolved (Session 6).** `apply_scenario` now rounds `(x, y)` once
+and uses the rounded value for both the particle spawn and the body
+position. New test `apply_scenario_rounds_body_position_to_particle_disk`
+guards against regression.
+**Resolved (Session 6).** Docstring numbers updated to match the
+code (r=50 throughout).
+**Resolved (Session 6).** Comment now says "circular orbit,
+COM-stationary init" and references SPEC decision #20.
+**Resolved (Session 6).** Session 4 now reads "27 tests pass
+(was 24, +3), 2 ignored".
+**Resolved (Session 6).** Comment now cites the commit message's
+measured 84-of-113 number instead of the speculative 62.
+**Resolved (Session 6).** Added Session 4 (BH-zoom fix) AND
+Session 5 (Newton's 3rd law) entries to HANDOFF.md.
+**Resolved (Session 6).** Removed unused import `crate::body::Body`
+from `sim.rs` tests; removed unused `initial_distance_sq` variable
+in the orbit test. `cargo test` is warning-clean.
+**Resolved (Session 6).** Comment deleted; nothing referenced it.
+**Resolved (Session 6).** `dump_default_scenario` now extends
+out to 800 ticks. SPEC Session 4 cites the measured value instead
+of the speculative "~34" framing.

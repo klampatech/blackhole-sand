@@ -699,7 +699,6 @@ fn gravity_step_legacy(x: i32, y: i32) -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::Body;
     use crate::material::Material;
 
     #[test]
@@ -858,13 +857,16 @@ mod tests {
         // Visual smoke test for the Phase 2 default scenario: 1 BH at
         // grid center, 1 planet 50 cells right on a circular orbit
         // (v=v_circ, COM-stationary init). Dumps RGBA at t=0/40/120/
-        // 240/400 to /tmp/bhsand_p2_t*.bin so the user can confirm the
-        // orbit + slow tidal strip reads. eprintln! output is the
-        // diagnostic trail for the BH+planet+COM trajectory; the test
-        // itself only asserts that the dumps succeed.
+        // 240/400/800 to /tmp/bhsand_p2_t*.bin so the user can confirm
+        // the orbit + slow tidal strip reads. The 800-tick checkpoint
+        // exists so SPEC.md Session 4 can cite an actual measured mass
+        // instead of the speculative "~34" estimate (Phase 2
+        // follow-up item 9). eprintln! output is the diagnostic trail
+        // for the BH+planet+COM trajectory; the test itself only
+        // asserts that the dumps succeed.
         use crate::scenario::default_scenario;
         use std::io::Write;
-        let checkpoints = [0usize, 40, 120, 240, 400];
+        let checkpoints = [0usize, 40, 120, 240, 400, 800];
         for &n in &checkpoints {
             let mut ww = World::new();
             default_scenario(&mut ww);
@@ -958,7 +960,6 @@ mod tests {
             body.position = glam::Vec2::new(HOLE_X as f32 + r, HOLE_Y as f32);
             body.velocity = glam::Vec2::new(0.0, v_circ);
         }
-        let initial_distance_sq = r * r;
         for _ in 0..400 {
             w.step();
         }
@@ -1069,8 +1070,10 @@ mod tests {
         // in-progress one. The fix routes the in-progress `claim`
         // array through find_target. This test guards against
         // regression by running the default scenario (113 particles
-        // on a near-collision orbit) for 40 ticks; without the fix
-        // ~62 particles vanish.
+        // on a circular orbit at r=50) for 40 ticks; without the
+        // fix a large fraction of a planet's particles can vanish
+        // during a close encounter — measured at 84 of 113 by t=200
+        // in the default scenario (per the 981a906 commit message).
         let mut w = World::new();
         // Spawn a BH far away so no event-horizon destruction can
         // occur — the only way the particle count can change is via
