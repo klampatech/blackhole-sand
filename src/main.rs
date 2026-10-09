@@ -7,6 +7,7 @@
 //! scenario. See `src/scenario.rs` for the spec syntax.
 
 mod app;
+mod barnes_hut;
 mod body;
 mod material;
 mod scenario;

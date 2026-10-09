@@ -20,6 +20,114 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 ## Log
 
 
+### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
+
+- User playtest feedback: click-spawned planets fell straight into
+  the BH (they spawned with `v=(0,0)`), which was confusing because
+  the default scenario clearly orbits. User picked "align
+  click-spawn with default-scenario physics" over "disable
+  click-spawn".
+- New `World::spawn_planet_in_orbit(cx, cy, radius, mat) ->
+  Option<u32>` in `src/sim.rs`: finds the first BlackHole, computes
+  the radial vector, returns `None` on `r < 1.0`, then spawns the
+  planet via the existing `spawn_planet` and applies
+  `v_planet = v_circ · (−dy, dx) / r` (CCW tangential) plus
+  `Δv_BH = −(m_planet / m_BH) · v_planet` (COM-stationary
+  recoil, decision #19). `App::spawn_planet_at_cursor` now calls
+  this. Three new tests in `sim::tests`: tangential velocity + recoil
+  + zero system momentum, `None` without BH, `None` on top of BH.
+- Decision #28 added (click-spawn = tangential circular orbit +
+  BH recoil, "first BH wins" for multi-BH scenes). Session 8 entry
+  added to `docs/SPEC.md` and this file.
+- 39 tests pass (was 36, +3), 3 ignored. Default-scenario dump is
+  byte-for-byte identical to the Phase 2/3 baseline
+  (BH=(136.73, 124.97) at t=400). `cargo build` is warning-clean.
+- **Playtest fix (same session):** first visual playtest surfaced
+  an OOB panic in `recompute_bonds` at `src/sim.rs:704`: a
+  planet particle migrating to (255, 255) still carried a
+  `BOND_SE` bit in its `bond_state` from when it was at a
+  more central cell; the adjacency bounds check didn't apply
+  to the mirror-clear target. Same class of bug existed in
+  `spawn_planet`'s disk-fill loop (pushed OOB cells when the
+  click was near the edge, panicked in the body-index stamp).
+  Both fixed: `recompute_bonds` now bounds-checks each
+  mirror-clear target; `spawn_planet` skips OOB cells up
+  front. Five new tests in `sim::tests` cover all four edges
+  plus the spawn edge.
+- 44 tests pass (was 39, +5), 3 ignored. Default-scenario
+  dump is byte-for-byte identical to the Phase 2/3 baseline.
+  `cargo build` is warning-clean.
+
+### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
+
+- New module `src/barnes_hut.rs` (flat `Vec<QuadNode>` quadtree,
+  `QuadTree::new(bodies, theta)` build, `compute_accel(p)` walk
+  with s/d<theta criterion). Integrated into `move_pass` via a
+  new `gravity_step_for_cell_bh`; the path activates when
+  `bodies.len() >= 8`. Body-body gravity stays N² pairwise.
+- Decisions #23–#27 added (theta=0.5 default, threshold=8, rebuild
+  every tick, body-body N² stays, Plummer softening in tree).
+- 36 tests pass (was 29, +7 — 5 in barnes_hut, 2 in sim);
+  3 ignored. Perf: 10 BHs + 65k particles at 7.4 ms/tick; 100
+  BHs + 63k particles at 15.2 ms/tick — both well under the
+  33 ms/tick budget for 30+ fps.
+- **Playtest status:** default-scenario dump (the visual smoke
+  test) is byte-for-byte identical to the Phase 2 baseline
+  (the default scenario has 2 bodies, so Barnes-Hut is not
+  exercised). Barnes-Hut-vs-N² equivalence verified at 5%
+  relative error for 8 bodies; the 8+ body regime is the
+  Phase 3 trigger from the spec.
+- **Next up:** open PR for review; visual playtest on real
+  hardware to confirm the multi-body "tidal peel" reads
+  correctly; Phase 4 (bodies as first-class objects with
+  shape templates) is now the next major chunk of work.
+
+### 2026-10-08 — Session 4: Phase 2 hardening (BH-zoom playtest fix)
+
+- Three real bugs were behind the MacBook "BH zooms around" report
+  from the default-scenario playtest: (1) `move_pass` silently lost
+  particles when two converged on the same cell (up to 84 of 113 in
+  the default scenario by t=200) because `find_target` only checked
+  the *original* grid, not the in-progress `claim` array; (2) a
+  Frankenstein integrator (Forward Euler on velocity, Verlet on
+  position) was gaining energy and spiraling orbits outward; (3) the
+  default scenario's near-collision orbit was throwing the planet
+  off the grid where its pinned mass dragged the BH around. All
+  three fixed: pass `claim` into `find_target`, switch to a proper
+  KDK leapfrog, and replace the default with a circular orbit at
+  r=50 with COM-stationary initial velocities.
+- New tests: `move_pass_does_not_lose_particles`,
+  `leapfrog_does_not_gain_energy_in_pure_orbit`,
+  `body_body_gravity_conserves_momentum`. 27 pass, 2 ignored.
+- **Playtest status:** T3 Code verified the BH stays near grid
+  center and the planet completes a circular orbit; the user
+  confirmed the playtest on the m5. Perf sanity (10 BHs + 65k
+  particles) is 3.3 ms/tick — within budget.
+- **Next up:** open PR #4 for review; pick up the remaining
+  Newton's-3rd-law event-horizon hole in a follow-up.
+
+### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
+
+- Closed the last Phase 2 hole flagged in Session 4: particles
+  consumed at the BH's event horizon used to vanish with their
+  momentum, leaving the BH to retain its pre-consumption velocity
+  and breaking conservation of total system momentum. The COM-
+  stationary default init hid the symptom; head-on / off-COM
+  configs would have shown the BH lurching.
+- `apply_event_horizons` now applies `Δv_BH = v_particle / M_BH`
+  per consumed particle (v_particle ≈ owning planet body velocity).
+  Recoil is accumulated per BH in a small `Vec` and applied at the
+  end of the destruction loop to avoid borrow conflicts with the
+  per-planet `particle_budget` decrement. Decision #22 added.
+- New test `event_horizon_conserves_total_momentum` runs the
+  COM-stationary default to consumption: total system momentum
+  stays ≤ 5 mass-units*cells/tick end-to-end, and the BH ends up
+  with |v| ≤ 0.1 cells/tick (its initial recoil has been cancelled
+  by the absorbed planet momentum). 28 pass, 2 ignored.
+- **Playtest status:** dump at t=400 shows BH velocity dropped
+  from initial (0, -0.045) to (0.005, 0.017) — nearly stationary
+  at the COM, as the math predicts. Perf sanity 3.41 ms/tick.
+
 ### 2026-10-08 — Session 3: Phase 2 ships
 
 - Phase 2 build complete on branch `feat/phase-2-multi-body-gravity`

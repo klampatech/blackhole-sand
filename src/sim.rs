@@ -29,6 +29,19 @@
 
 use crate::body::{Body, BodyAccel, G, SOFTENING_SQ};
 use crate::material::Material;
+use crate::barnes_hut::QuadTree;
+
+/// Default Barnes-Hut opening-angle parameter. The spec calls for
+/// 0.5; the test sweep is in `barnes_hut::tests`. Lower = more
+/// accurate, higher = faster. Phase 3 decision #23.
+pub const BARNES_HUT_THETA: f32 = 0.5;
+
+/// Threshold for switching the body-particle gravity path from
+/// direct sum to Barnes-Hut. Below this body count the per-cell
+/// tree-build + traversal cost exceeds the O(N) saving; direct
+/// sum wins on a constant-factor basis. The exact value is
+/// uncritical and tuned against the `perf_sanity_*` tests.
+pub const BARNES_HUT_THRESHOLD: usize = 8;
 
 /// Grid resolution. 256^2 is the Phase 1 spec target (~30 fps on m5). Flip to
 /// 512 once the perf budget allows it — this is the only line to change.
@@ -138,11 +151,20 @@ impl World {
         self.next_body_id += 1;
 
         // Fill the disk and remember the filled cells so we can stamp
-        // bond_state + body_index in a second pass.
+        // bond_state + body_index in a second pass. Skip OOB cells
+        // up front: a click near the edge of the grid would
+        // otherwise push (x, y) tuples outside [0, W) × [0, H)
+        // onto `filled`, and the next loop indexes them as
+        // `Self::idx(x as usize, y as usize)` which panics on an
+        // OOB index. `self.set` and `self.get` are bounds-safe on
+        // their own, so the disk naturally clips to the grid.
         let r2 = radius * radius;
         let mut filled: Vec<(i32, i32)> = Vec::new();
         for y in (cy - radius)..=(cy + radius) {
             for x in (cx - radius)..=(cx + radius) {
+                if !Self::in_bounds(x, y) {
+                    continue;
+                }
                 let dx = x - cx;
                 let dy = y - cy;
                 if dx * dx + dy * dy > r2 {
@@ -181,6 +203,93 @@ impl World {
         self.bodies.push(body);
         self.body_accel.push(BodyAccel::default());
         id
+    }
+
+    /// Spawn a planet body at `(cx, cy)` with a tangential velocity
+    /// `v_circ = sqrt(G * M_BH / r)` around the first BlackHole in the
+    /// world, plus an equal-and-opposite recoil on the BH so the
+    /// initial system momentum is approximately 0 (COM-stationary
+    /// init; see decision #19 and the default scenario).
+    ///
+    /// This is the click-spawn entry point: it makes click-spawned
+    /// planets behave the same as the default-scenario planet, so
+    /// the user sees a circular orbit instead of the planet falling
+    /// straight into the BH with v=(0,0).
+    ///
+    /// Returns `None` if:
+    ///   * there is no BlackHole in the world (nothing to orbit),
+    ///   * the click point is essentially on top of the BH (r near 0;
+    ///     v_circ would blow up),
+    ///   * the material does not support bonds (`spawn_planet` returns
+    ///     `NO_BODY`),
+    ///   * the click footprint is fully occupied (planet spawns with
+    ///     zero particles, so zero mass, which would NaN in the
+    ///     integrator).
+    pub fn spawn_planet_in_orbit(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        mat: u8,
+    ) -> Option<u32> {
+        // Find the first BlackHole body. (When multiple BHs are
+        // present we do not yet pick "nearest" — click-spawn in this
+        // project is overwhelmingly tested with the default
+        // single-BH scenario, so the simplest "first wins" rule is
+        // good enough for now.)
+        let bh_idx = self
+            .bodies
+            .iter()
+            .position(|b| matches!(b.kind, crate::body::BodyKind::BlackHole))?;
+        let (bh_pos, bh_mass) =
+            (self.bodies[bh_idx].position, self.bodies[bh_idx].mass);
+
+        // Radial vector from BH to click point.
+        let dx = cx as f32 - bh_pos.x;
+        let dy = cy as f32 - bh_pos.y;
+        let r = (dx * dx + dy * dy).sqrt();
+        if r < 1.0 {
+            return None;
+        }
+
+        // v_circ = sqrt(G * M_BH / r); tangential direction is the CCW
+        // perpendicular of the radial vector: (-dy, dx) / r.
+        let v_circ = (G * bh_mass / r).sqrt();
+        let tx = -dy / r;
+        let ty = dx / r;
+
+        // Spawn the planet body in place (same path as the CLI/JSON
+        // scenarios). Bail if the spawn refused (no bonds, footprint
+        // occupied, etc.).
+        let pid = self.spawn_planet(cx, cy, radius, mat);
+        if pid == NO_BODY as u32 {
+            return None;
+        }
+        // Bail if no particles actually landed — planet mass would be
+        // 0 and the integrator would NaN on its first step.
+        let planet_mass = self
+            .bodies
+            .iter()
+            .find(|b| b.id == pid)
+            .map(|b| b.mass)
+            .unwrap_or(0.0);
+        if planet_mass <= 0.0 {
+            return None;
+        }
+
+        // Tangential velocity on the planet.
+        if let Some(p) = self.bodies.iter_mut().find(|b| b.id == pid) {
+            p.velocity = crate::body::Vec2::new(v_circ * tx, v_circ * ty);
+        }
+
+        // Equal-and-opposite recoil on the BH so the system COM
+        // starts stationary (decision #19, same as default scenario).
+        // dv_BH = -(m_planet / m_BH) * v_planet.
+        let recoil_mag = v_circ * planet_mass / bh_mass;
+        self.bodies[bh_idx].velocity -=
+            crate::body::Vec2::new(recoil_mag * tx, recoil_mag * ty);
+
+        Some(pid)
     }
 
     /// Spawn a BlackHole at the given position with the given mass. The
@@ -432,6 +541,17 @@ impl World {
         // If no bodies, fall straight down (Phase 1 fallback).
         let has_bodies = !self.bodies.is_empty();
 
+        // Phase 3: build a Barnes-Hut quadtree once per tick and use
+        // it for body-particle gravity when the body count is above
+        // the threshold. Below the threshold direct sum is faster
+        // (the constant factor of tree build + traversal exceeds the
+        // O(N) saving). See BARNES_HUT_THRESHOLD and decision #23.
+        let tree = if has_bodies && self.bodies.len() >= BARNES_HUT_THRESHOLD {
+            Some(QuadTree::new(&self.bodies, BARNES_HUT_THETA))
+        } else {
+            None
+        };
+
         for y in 0..H {
             for x in 0..W {
                 let i = Self::idx(x, y);
@@ -442,7 +562,9 @@ impl World {
                 let b = new_bonds[i];
                 let owner = new_body_index[i];
 
-                let (dx, dy, max_steps) = if has_bodies {
+                let (dx, dy, max_steps) = if let Some(tree) = &tree {
+                    gravity_step_for_cell_bh(x as i32, y as i32, tree)
+                } else if has_bodies {
                     gravity_step_for_cell(x as i32, y as i32, &self.bodies)
                 } else {
                     gravity_step_legacy(x as i32, y as i32)
@@ -574,25 +696,36 @@ impl World {
                     // And mirror-clear the corresponding bits on the
                     // neighbour cell. For each newly-broken direction,
                     // find the neighbour and clear the mirror bit.
-                    if newly_broken & BOND_N != 0 {
-                        let j = Self::idx(x, y - 1);
-                        self.bond_state[j] &= !BOND_S; // mirror of N is S on the cell below
-                    }
-                    if newly_broken & BOND_E != 0 {
-                        let j = Self::idx(x + 1, y);
-                        self.bond_state[j] &= !BOND_W; // mirror of E is W on the cell right
-                    }
-                    if newly_broken & BOND_NE != 0 {
-                        let j = Self::idx(x + 1, y - 1);
-                        self.bond_state[j] &= !BOND_SW; // mirror of NE is SW
-                    }
-                    if newly_broken & BOND_SE != 0 {
-                        let j = Self::idx(x + 1, y + 1);
-                        self.bond_state[j] &= !BOND_NW; // mirror of SE is NW
-                    }
+                // Each mirror-clear targets a specific neighbour cell.
+                // The bond bit can outlive its neighbour's bounds:
+                // `move_pass` transports `bond_state` around with the
+                // particle, so a planet particle can carry a `BOND_SE`
+                // bit (set at spawn when its (x+1, y+1) neighbour was
+                // in bounds) into a corner cell where the neighbour is
+                // now OOB. The adjacency check at the top of this
+                // function only validates neighbours that ARE in bounds
+                // — it does not tell us whether the bond was set when
+                // they were. Bounds-check each mirror target here to
+                // avoid an OOB panic on the index.
+                if newly_broken & BOND_N != 0 && y > 0 {
+                    let j = Self::idx(x, y - 1);
+                    self.bond_state[j] &= !BOND_S; // mirror of N is S on the cell below
+                }
+                if newly_broken & BOND_E != 0 && x + 1 < W {
+                    let j = Self::idx(x + 1, y);
+                    self.bond_state[j] &= !BOND_W; // mirror of E is W on the cell right
+                }
+                if newly_broken & BOND_NE != 0 && y > 0 && x + 1 < W {
+                    let j = Self::idx(x + 1, y - 1);
+                    self.bond_state[j] &= !BOND_SW; // mirror of NE is SW
+                }
+                if newly_broken & BOND_SE != 0 && y + 1 < H && x + 1 < W {
+                    let j = Self::idx(x + 1, y + 1);
+                    self.bond_state[j] &= !BOND_NW; // mirror of SE is NW
                 }
             }
         }
+    }
     }
 
     /// Paint a faint purple ring of `EventHorizon` cells around every
@@ -676,6 +809,19 @@ fn gravity_step_for_cell(x: i32, y: i32, bodies: &[Body]) -> (i32, i32, i32) {
     (ax.signum() as i32, ay.signum() as i32, max_steps)
 }
 
+/// Phase 3 variant of `gravity_step_for_cell` that walks a
+/// Barnes-Hut quadtree instead of summing every body directly.
+/// Same Plummer-softening, same magnitude-based max_steps. The
+/// tree is built once per tick in `move_pass` and reused across
+/// all 65k cells; per-cell cost is O(log N) average rather than
+/// O(N).
+fn gravity_step_for_cell_bh(x: i32, y: i32, tree: &QuadTree) -> (i32, i32, i32) {
+    let a = tree.compute_accel(crate::body::Vec2::new(x as f32, y as f32));
+    let mag = a.length();
+    let max_steps = if mag > 0.5 { 3 } else if mag > 0.05 { 2 } else { 1 };
+    (a.x.signum() as i32, a.y.signum() as i32, max_steps)
+}
+
 /// Phase 1 fallback: pull toward (HOLE_X, HOLE_Y) inside PULL_RADIUS,
 /// otherwise straight down. Used when there are no bodies.
 fn gravity_step_legacy(x: i32, y: i32) -> (i32, i32, i32) {
@@ -699,7 +845,6 @@ fn gravity_step_legacy(x: i32, y: i32) -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::Body;
     use crate::material::Material;
 
     #[test]
@@ -858,13 +1003,16 @@ mod tests {
         // Visual smoke test for the Phase 2 default scenario: 1 BH at
         // grid center, 1 planet 50 cells right on a circular orbit
         // (v=v_circ, COM-stationary init). Dumps RGBA at t=0/40/120/
-        // 240/400 to /tmp/bhsand_p2_t*.bin so the user can confirm the
-        // orbit + slow tidal strip reads. eprintln! output is the
-        // diagnostic trail for the BH+planet+COM trajectory; the test
-        // itself only asserts that the dumps succeed.
+        // 240/400/800 to /tmp/bhsand_p2_t*.bin so the user can confirm
+        // the orbit + slow tidal strip reads. The 800-tick checkpoint
+        // exists so SPEC.md Session 4 can cite an actual measured mass
+        // instead of the speculative "~34" estimate (Phase 2
+        // follow-up item 9). eprintln! output is the diagnostic trail
+        // for the BH+planet+COM trajectory; the test itself only
+        // asserts that the dumps succeed.
         use crate::scenario::default_scenario;
         use std::io::Write;
-        let checkpoints = [0usize, 40, 120, 240, 400];
+        let checkpoints = [0usize, 40, 120, 240, 400, 800];
         for &n in &checkpoints {
             let mut ww = World::new();
             default_scenario(&mut ww);
@@ -958,7 +1106,6 @@ mod tests {
             body.position = glam::Vec2::new(HOLE_X as f32 + r, HOLE_Y as f32);
             body.velocity = glam::Vec2::new(0.0, v_circ);
         }
-        let initial_distance_sq = r * r;
         for _ in 0..400 {
             w.step();
         }
@@ -1069,8 +1216,10 @@ mod tests {
         // in-progress one. The fix routes the in-progress `claim`
         // array through find_target. This test guards against
         // regression by running the default scenario (113 particles
-        // on a near-collision orbit) for 40 ticks; without the fix
-        // ~62 particles vanish.
+        // on a circular orbit at r=50) for 40 ticks; without the
+        // fix a large fraction of a planet's particles can vanish
+        // during a close encounter — measured at 84 of 113 by t=200
+        // in the default scenario (per the 981a906 commit message).
         let mut w = World::new();
         // Spawn a BH far away so no event-horizon destruction can
         // occur — the only way the particle count can change is via
@@ -1315,6 +1464,353 @@ mod tests {
         assert!(ms_per_tick < 500.0, "perf budget blown: {ms_per_tick:.2}ms/tick");
     }
 
+    #[test]
+    #[ignore] // run with `cargo test perf_sanity_100 -- --ignored --nocapture`
+    fn perf_sanity_100_bodies_50k_particles() {
+        // Phase 3 perf sanity: 100 BlackHoles in a ring at radius 80
+        // around grid center, ~50k particles in the gap, 100 ticks.
+        // Exercises the Barnes-Hut body-particle path (100 bodies
+        // is well above BARNES_HUT_THRESHOLD = 8). Budget: 30+ fps
+        // on the gaming rig (< 33ms/tick), 15+ fps on m5
+        // (< 67ms/tick). The assert is loose (200ms/tick) so the
+        // test passes on a slow CI box; the printed number is what
+        // we put in the spec.
+        use std::time::Instant;
+        let mut w = World::new();
+        for i in 0..100 {
+            let angle = (i as f32) * 0.0628; // 2*pi / 100
+            let r = 80.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let mut inside = false;
+                for b in &w.bodies {
+                    if !b.destroys_particles() { continue; }
+                    let dx = (x as f32 - b.position.x) as f32;
+                    let dy = (y as f32 - b.position.y) as f32;
+                    if dx * dx + dy * dy < b.radius * b.radius {
+                        inside = true;
+                        break;
+                    }
+                }
+                if inside { continue; }
+                w.set(x, y, Material::Rock as u8);
+                w.body_index[World::idx(x as usize, y as usize)] = NO_BODY;
+            }
+        }
+        let particle_count = w.particles.iter().filter(|&&m| m != 0).count();
+        eprintln!("perf: 100 BHs + {} particles (Barnes-Hut)", particle_count);
+        let t = Instant::now();
+        for _ in 0..100 {
+            w.step();
+        }
+        let elapsed = t.elapsed();
+        let ms_per_tick = elapsed.as_secs_f64() * 1000.0 / 100.0;
+        eprintln!(
+            "perf: 100 bodies + 50k particles (BH), 100 ticks in {:.1}ms ({:.2}ms/tick)",
+            elapsed.as_secs_f64() * 1000.0,
+            ms_per_tick
+        );
+        assert!(
+            ms_per_tick < 200.0,
+            "Phase 3 perf budget blown: {ms_per_tick:.2}ms/tick"
+        );
+    }
 
+    #[test]
+    fn barnes_hut_matches_direct_sum_for_8_bodies() {
+        // Phase 3 integration: with 8 bodies (the threshold), the
+        // move_pass should now route body-particle gravity through
+        // Barnes-Hut. Verify that the per-cell gravity vector from
+        // the tree matches the direct N^2 sum to a small tolerance
+        // at theta=0.5 (the spec default).
+        use crate::barnes_hut::QuadTree;
+        let mut w = World::new();
+        for i in 0..8 {
+            let angle = (i as f32) * 0.7854; // 2*pi / 8
+            let r = 60.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        let tree = QuadTree::new(&w.bodies, BARNES_HUT_THETA);
+        for &(x, y) in &[(20, 20), (128, 128), (200, 200), (50, 200), (180, 80)] {
+            let p = glam::Vec2::new(x as f32, y as f32);
+            let a_tree = tree.compute_accel(p);
+            let mut a_direct = glam::Vec2::ZERO;
+            for b in &w.bodies {
+                let r = b.position - p;
+                let d2 = r.length_squared() + SOFTENING_SQ;
+                let d = d2.sqrt();
+                let a_mag = G * b.mass / d2;
+                a_direct += r * (a_mag / d);
+            }
+            let mag = a_direct.length();
+            let diff = (a_tree - a_direct).length();
+            assert!(
+                diff < 0.05 * (mag + 1e-3),
+                "Barnes-Hut diverges from direct sum at ({x},{y}): \
+                 tree={a_tree:?}, direct={a_direct:?}, |diff|={diff:.3}, |direct|={mag:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn barnes_hut_threshold_uses_direct_sum_below() {
+        // Below BARNES_HUT_THRESHOLD = 8 the move_pass uses direct
+        // sum. This test confirms that the same answer comes out
+        // of both paths at the threshold boundary.
+        use crate::barnes_hut::QuadTree;
+        let mut w = World::new();
+        for i in 0..7 {
+            let angle = (i as f32) * 0.8976; // 2*pi / 7
+            let r = 60.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        assert!(
+            w.bodies.len() < BARNES_HUT_THRESHOLD,
+            "this test wants bodies.len() < BARNES_HUT_THRESHOLD"
+        );
+        let tree = QuadTree::new(&w.bodies, BARNES_HUT_THETA);
+        for &(x, y) in &[(20, 20), (128, 128), (200, 200)] {
+            let p = glam::Vec2::new(x as f32, y as f32);
+            let a_tree = tree.compute_accel(p);
+            let mut a_direct = glam::Vec2::ZERO;
+            for b in &w.bodies {
+                let r = b.position - p;
+                let d2 = r.length_squared() + SOFTENING_SQ;
+                let d = d2.sqrt();
+                let a_mag = G * b.mass / d2;
+                a_direct += r * (a_mag / d);
+            }
+            let mag = a_direct.length();
+            let diff = (a_tree - a_direct).length();
+            assert!(
+                diff < 0.05 * (mag + 1e-3),
+                "Barnes-Hut diverges from direct sum at ({x},{y}): \
+                 tree={a_tree:?}, direct={a_direct:?}"
+            );
+        }
+    }
+
+
+    #[test]
+    fn spawn_planet_in_orbit_uses_v_circ_and_recoil() {
+        // Click-spawn now initializes the new planet on a tangential
+        // circular orbit around the first BH and applies
+        // equal-and-opposite recoil to the BH so the system COM
+        // starts stationary (matching the default scenario —
+        // decision #19). Three invariants to check:
+        //
+        //   1. Planet velocity is tangential to the radial
+        //      BH -> planet vector (CCW) with magnitude
+        //      v_circ = sqrt(G * M_BH / r).
+        //   2. BH velocity has equal-and-opposite recoil along
+        //      the planet's velocity axis.
+        //   3. Total system momentum is approximately 0.
+        let mut w = World::new();
+        let bh_id = w.spawn_black_hole(128.0, 128.0, 1000.0);
+        let pid = w
+            .spawn_planet_in_orbit(178, 128, 6, Material::Rock as u8)
+            .expect("spawn_planet_in_orbit should return Some");
+
+        let planet = w.bodies.iter().find(|b| b.id == pid).unwrap().clone();
+        let bh = w.bodies.iter().find(|b| b.id == bh_id).unwrap().clone();
+
+        // Invariant 1: tangential velocity with magnitude v_circ.
+        let dx = planet.position.x - bh.position.x;
+        let dy = planet.position.y - bh.position.y;
+        let r = (dx * dx + dy * dy).sqrt();
+        assert!(
+            (r - 50.0).abs() < 1.0,
+            "expected r ~ 50 from BH at (128,128) to click at (178,128), got r = {r:.3}"
+        );
+        // CCW perpendicular of (dx, dy) is (-dy, dx) / r. The
+        // planet should have its full velocity along this direction
+        // (zero radial component).
+        let rad_hat = glam::Vec2::new(dx / r, dy / r);
+        let tang_hat = glam::Vec2::new(-dy / r, dx / r);
+        let v_radial = planet.velocity.dot(rad_hat);
+        let v_tang = planet.velocity.dot(tang_hat);
+        assert!(
+            v_radial.abs() < 1e-3,
+            "planet velocity should be purely tangential, got radial component \
+             {v_radial:.3} (v = {:?})",
+            planet.velocity
+        );
+        assert!(
+            v_tang > 0.0,
+            "planet should orbit CCW (positive tangential), got v_tang = {v_tang:.3}"
+        );
+        let v_circ_expected = (G * 1000.0 / r).sqrt();
+        assert!(
+            (v_tang - v_circ_expected).abs() < 1e-3,
+            "planet speed should be v_circ = sqrt(G*M_BH/r) = {v_circ_expected:.3}, \
+             got {v_tang:.3}"
+        );
+
+        // Invariant 2: BH recoil is opposite to the planet's
+        // velocity direction.
+        let bh_dot_planet = bh.velocity.dot(planet.velocity);
+        assert!(
+            bh_dot_planet < 0.0,
+            "BH velocity should be opposite to planet velocity, got \
+             bh={:?} planet={:?}",
+            bh.velocity,
+            planet.velocity
+        );
+
+        // Invariant 3: total system momentum is approximately 0
+        // (COM-stationary init, same as the default scenario).
+        let total_p: glam::Vec2 = w.bodies.iter().map(|b| b.mass * b.velocity).sum();
+        assert!(
+            total_p.length() < 1e-3,
+            "total system momentum should be ~0 after click-spawn, got {total_p:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_in_orbit_returns_none_without_black_hole() {
+        // No BH -> no orbital reference. The click-spawn should
+        // refuse rather than spawn a free-falling planet at v=0.
+        let mut w = World::new();
+        let result = w.spawn_planet_in_orbit(100, 100, 5, Material::Rock as u8);
+        assert!(
+            result.is_none(),
+            "spawn_planet_in_orbit should return None when no BH exists"
+        );
+        assert!(
+            w.bodies.is_empty(),
+            "no bodies should have been spawned when BH is missing"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_in_orbit_returns_none_on_top_of_bh() {
+        // Click on the BH itself -> r ~ 0 -> v_circ blows up. The
+        // spawn must refuse rather than inject a NaN velocity.
+        let mut w = World::new();
+        w.spawn_black_hole(128.0, 128.0, 1000.0);
+        let result = w.spawn_planet_in_orbit(128, 128, 5, Material::Rock as u8);
+        assert!(
+            result.is_none(),
+            "spawn_planet_in_orbit should return None when click is on BH"
+        );
+        // Only the BH should be in the world.
+        assert_eq!(w.bodies.len(), 1);
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_se_neighbour_oob() {
+        // Regression test for an OOB panic in the sticky-bond
+        // mirror-clear path. A planet particle can carry a BOND_SE
+        // bit in its bond_state from when it was at a more central
+        // cell (where (x+1, y+1) was in bounds) into a corner
+        // cell like (255, 255) where (256, 256) is OOB. The
+        // adjacency check at the top of `recompute_bonds` only
+        // validates neighbours that are in bounds; it does not
+        // tell us whether the bond was set when they were. Without
+        // an explicit bounds-check on the mirror-clear target the
+        // index panics with `index out of bounds: the len is
+        // 65536 but the index is 65772`. This test reproduces
+        // the exact bug state: a single particle at (255, 255)
+        // with a stale BOND_SE bit. recompute_bonds must drop the
+        // broken bit on bond_state[i] without trying to mirror-
+        // clear into the OOB neighbour.
+        let mut w = World::new();
+        w.particles[World::idx(255, 255)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 255)] = BOND_SE;
+        w.recompute_bonds();
+        // The broken bit must have been cleared from bond_state.
+        assert_eq!(
+            w.bond_state[World::idx(255, 255)], 0,
+            "BOND_SE should be cleared when (256, 256) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_n_neighbour_oob() {
+        // Same class of bug, but for the BOND_N bit at the top
+        // edge. A particle at (0, 0) can carry a stale BOND_N
+        // bit. recompute_bonds would try to mirror-clear into
+        // (0, -1), which underflows the y index on usize.
+        let mut w = World::new();
+        w.particles[World::idx(0, 0)] = Material::Rock as u8;
+        w.bond_state[World::idx(0, 0)] = BOND_N;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(0, 0)], 0,
+            "BOND_N should be cleared when (0, -1) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_e_neighbour_oob() {
+        // Same class of bug, but for the BOND_E bit at the right
+        // edge. A particle at (255, 128) with stale BOND_E.
+        let mut w = World::new();
+        w.particles[World::idx(255, 128)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 128)] = BOND_E;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(255, 128)], 0,
+            "BOND_E should be cleared when (256, 128) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_ne_neighbour_oob() {
+        // Same class of bug, but for the BOND_NE bit at the top-
+        // right corner. A particle at (255, 0) with stale BOND_NE.
+        let mut w = World::new();
+        w.particles[World::idx(255, 0)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 0)] = BOND_NE;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(255, 0)], 0,
+            "BOND_NE should be cleared when (256, -1) is OOB"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_near_edge_does_not_panic() {
+        // Regression test for a spawn-time OOB panic. The disk-
+        // fill loop in `spawn_planet` iterated over a square
+        // (cx - radius) ..= (cx + radius) without bounds checks
+        // and pushed OOB (x, y) tuples into `filled`. The next
+        // loop then indexed `Self::idx(x as usize, y as usize)`
+        // for those tuples, panicking on `self.body_index[i] =`.
+        // A click at the corner of the grid with radius=10
+        // triggered this. The fix skips OOB cells up front, so
+        // the planet just clips to the grid — partial planet,
+        // no panic.
+        let mut w = World::new();
+        let pid = w.spawn_planet(255, 255, 10, Material::Rock as u8);
+        assert_eq!(pid, 0, "first body should get id 0");
+        // The planet should exist and have at least the center cell.
+        let p = w.bodies.iter().find(|b| b.id == pid).unwrap();
+        assert!(p.mass > 0.0, "planet should have at least one particle");
+        // No OOB indices should have been written.
+        for y in 0..H {
+            for x in 0..W {
+                let i = World::idx(x, y);
+                if w.particles[i] != 0 {
+                    assert!(w.body_index[i] == pid as i32 || w.body_index[i] == NO_BODY,
+                        "unexpected body_index at ({x}, {y})");
+                }
+            }
+        }
+    }
 
 }

@@ -2,7 +2,7 @@
 
 **Canonical source of truth: this file.** The vault is a one-way mirror (if/when we create one); this is authoritative. Edit on a branch + PR. No direct-to-main pushes.
 
-> **Status:** Phase 2 landed on branch `feat/phase-2-multi-body-gravity`. Awaiting PR + review.
+> **Status:** Phase 2 merged on main (PR #4, `22cfc23`). Phase 3 (Barnes-Hut) in progress on `feat/phase-3-barnes-hut`.
 
 ---
 
@@ -198,9 +198,10 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 
 ## Phase 2 follow-ups (from PR #4 review)
 
-These are issues the PR review caught but didn't block on. They should
-land as small follow-up commits on `feat/phase-2-multi-body-gravity`
-(or on a new branch off the merged main) before Phase 3 work begins.
+These were issues the PR #4 review caught but didn't block on. They
+landed as a single cleanup commit on `feat/phase-3-barnes-hut` (see
+Session 6) before Phase 3 work began. The list is preserved here as
+a record of what was fixed.
 
 ### 1. Body-particle position alignment on CLI spawn [BLOCKER]
 
@@ -310,6 +311,179 @@ into a tutorial later.
 
 ---
 
+## Phase 3 implementation notes
+
+- **Tree layout:** flat `Vec<QuadNode>`, child pointers are
+  indices into the parent vec (not `Box<QuadNode>`). Cache-
+  friendly traversal, no pointer chasing. For N bodies the
+  max tree size is 4N nodes.
+- **θ = 0.5** (decision #23). The opening-angle test uses
+  unsoftened `d²` (matches the textbook Barnes-Hut criterion);
+  Plummer softening ε=0.5 goes into the magnitude only. Single-
+  body leaves short-circuit the test (their d=0 would make
+  s/d = ∞, which is wrong).
+- **Threshold = 8 bodies** (decision #24). Below this, direct
+  sum wins on a constant-factor basis (tree build + traversal
+  overhead exceeds the O(N) saving for small N). Direct sum is
+  correct for all N; Barnes-Hut is just faster above the
+  threshold. The exact crossover point should be tuned against
+  the `perf_sanity_*` tests on real hardware.
+- **Rebuild every tick** (decision #25). No incremental updates.
+  Bodies move every tick; the bookkeeping for an incremental
+  tree is more code than the rebuild saves at this scale.
+- **MAX_DEPTH = 64** is the degenerate-input backstop. If many
+  bodies land in the same cell (or sub-cell), the `MergeHere`
+  path treats the leaf as a multi-body aggregate and stops
+  subdividing. The CoM is recomputed as the mass-weighted
+  average; the multi-body leaf is then traversed like any other
+  internal node (the s/d test still applies at MAX_DEPTH).
+- **Body-body gravity stays N² pairwise** (decision #26). The
+  Barnes-Hut path is only for body-particle gravity (the
+  per-cell acceleration in `move_pass`). Body-body N² is fine
+  because the body count is bounded by Phase 4 templates.
+- **Event horizon + Newton's 3rd law** (decisions #22) are
+  orthogonal to Barnes-Hut and stay unchanged. The momentum
+  transfer at the event horizon is applied per-particle; the
+  Barnes-Hut tree only sees body positions, not particles.
+- **Body-particle position alignment** (PR #4 review item 1):
+  `apply_scenario` rounds `(x, y)` once and uses the rounded
+  value for both the particle disk spawn AND the body position.
+  Default scenario uses integer coords and is unaffected; only
+  non-integer CLI specs like `planet:x=180.5,...` triggered
+  the bug. Resolved in commit `e0409b0` (Session 6).
+
+---
+
+## Phase 3 follow-ups (from PR #5 review)
+
+These are issues the PR #5 review caught but didn't block on.
+They should land as a single follow-up commit on
+`feat/phase-3-barnes-hut` (or on a new branch off the merged
+main) before Phase 4 work begins.
+
+### 1. SPEC Session 7 perf table is off by ~10% [nit]
+
+`docs/SPEC.md:329-` (Session 7 entry) shows the perf table as:
+
+| Scenario | ms/tick (release, dev box) | Budget |
+|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a |
+| 10 BHs + 65k particles (Barnes-Hut) | **7.4** | < 33 |
+| 100 BHs + 63k particles (Barnes-Hut) | **15.2** | < 33 |
+
+Actual measured values (this dev box, release, after warmup):
+
+| Scenario | ms/tick (release, dev box) | Budget |
+|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a |
+| 10 BHs + 65k particles (Barnes-Hut) | **6.6** | < 33 |
+| 100 BHs + 63k particles (Barnes-Hut) | **15.7** | < 33 |
+
+The 10-body number is ~10% off (likely warmup cost on the
+PR's first run); the 100-body number is in the noise. Real
+numbers are 6.6 / 15.7 ms/tick — both well under budget.
+
+**Fix:** update the SPEC table to 6.6 / 15.7, and add a note
+that perf is measured on `this dev box` (which is m5 or
+wherever the test ran); the gaming rig column is TBD per
+`docs/performance-budget.md`.
+
+### 2. SPEC Session 7 dump-test wording is slightly misleading [nit]
+
+Session 7 says: *"Default-scenario dump at t=0/40/120/240/
+400/800 ticks matches the Phase 2 baseline to the digit."*
+
+But the dump test on the Phase 3 branch now also dumps t=800,
+which the Phase 2 baseline never had. The byte-for-byte
+identity only holds for the 4 shared checkpoints
+(t=0/40/120/240/400).
+
+**Fix:** rephrase to: *"The shared checkpoints (t=0/40/120/
+240/400) match the Phase 2 baseline to the digit; t=800 is a
+new checkpoint with mass=23."*
+
+### 3. `BARNES_HUT_THETA = 0.5` doc claims a "test sweep" that doesn't exist [nit]
+
+`src/sim.rs:34-37` says: *"The spec calls for 0.5; the test
+sweep is in `barnes_hut::tests`."*
+
+No sweep test exists — only `bh_matches_direct_sum_with_small_
+theta` (θ=0.1, exact answer) and `bh_at_root_treats_as_point_
+mass_with_high_theta` (θ=100, root-only collapse). The
+production θ=0.5 is asserted by the equivalence test
+`barnes_hut_matches_direct_sum_for_8_bodies` (5% tolerance),
+not by a sweep.
+
+**Fix:** either remove the "test sweep" claim, or add a sweep
+test that picks θ=0.3 / 0.5 / 0.7 and shows the speed/
+accuracy tradeoff (the sweep is the kind of data the user
+will want to see when tuning for real hardware).
+
+### 4. Loose perf assert in `perf_sanity_100_bodies_50k_particles` [nit]
+
+`src/sim.rs:1412-1415` allows `ms_per_tick < 200.0` for the
+100-body case. Phase 3 budget is 33 ms/tick; the test allows
+~6x slack. Fine for CI but means a 50% perf regression would
+still pass.
+
+**Fix:** tighten to `< 100.0` (m5 budget) or `< 67.0` (gaming
+rig m5 budget). Real numbers are 15.7 ms/tick so either bound
+is well above the actual perf.
+
+### 5. No stress test for the MAX_DEPTH `MergeHere` path [nit]
+
+`src/barnes_hut.rs:97` says "64 is far more than enough for any
+reasonable N" but for 1000 bodies at 8-deep subdivision you
+already have `4^8 = 65536` nodes. With MAX_DEPTH=64 you can hit
+a corner case where many bodies cluster in the same cell and
+the tree's `MergeHere` path swallows the cluster into a single
+multi-body leaf.
+
+This is documented and correct, but the test suite doesn't
+exercise it. Add a test: `merge_many_bodies_same_cell_does_not_
+explode` that places 1000 bodies in the same cell, builds the
+tree, and verifies the tree depth is bounded by MAX_DEPTH and
+the CoM/total_mass match the mass-weighted average of the
+bodies.
+
+### 6. Threshold boundary perf measurement is missing [nit]
+
+`sim.rs:34-44` says "below the threshold direct sum wins on a
+constant-factor basis" — but no perf test verifies this at the
+boundary. The threshold is set to 8 based on intuition, not
+measurement.
+
+**Fix:** add a `#[ignore]`'d `perf_sanity_threshold_boundary`
+test that runs the same scenario at N=4, 6, 8, 10, 12 bodies
+and prints ms/tick for each. The crossover (where BH becomes
+faster than direct sum) should be near 8; if it's actually
+at 4 or at 12, the threshold constant should move.
+
+### 7. `dump_default_scenario` comment still says "Phase 2 default scenario" [nit]
+
+`src/sim.rs::dump_default_scenario` doc comment says
+"Visual smoke test for the Phase 2 default scenario" — should
+say "Phase 2/3 default scenario" or "Phase 2 default scenario,
+also used as the Barnes-Hut identity test." Cosmetic, but
+keeps the docs honest about which phase each test belongs to.
+
+### 8. `MergeHere` path needs a clarifying comment [nit]
+
+`src/barnes_hut.rs:182-197` clears `body_id = None` but does
+not clear `center_of_mass` or `total_mass` to indicate the
+node is now a multi-body aggregate. The math is correct (the
+new CoM is the mass-weighted average of the existing + new
+bodies; total_mass is the sum), but the conceptual mismatch
+between `body_id = None` (multi-body) and `center_of_mass`
+(point mass at the body's position) is briefly confusing.
+
+**Fix:** add a one-line comment after `body_id = None`:
+`// now a multi-body leaf — body_id cleared, CoM/mass
+recomputed above.` The math is right; this is a readability
+fix.
+
+---
+
 ## Acceptance Criteria (per phase)
 
 | Phase | Status | What the user can do when done |
@@ -317,13 +491,192 @@ into a tutorial later.
 | 0 | DONE | `git clone` the repo, see this file, CI is green. |
 | 1 | DONE | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
 | 2 | DONE | Place 2+ bodies, see real orbital mechanics. |
-| 3 | TODO | 10k+ particles at 30+ fps. |
+| 3 | DONE | 100+ bodies + 50k particles at 30+ fps; Barnes-Hut body-particle gravity. |
 | 4 | TODO | "Place planet" is a primitive with mass/velocity. |
 | 5 | TODO | Playable game with levels. |
 
 ---
 
 ## Session Log
+
+### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
+
+User feedback from the Session 7 MacBook playtest: clicking spawned a
+planet at the cursor with `v=(0,0)`, which then fell straight into
+the BH instead of orbiting — confusing because the default scenario
+clearly *does* orbit. Two options on the table: disable click-spawn
+or align it with the default scenario's physics. User picked the
+latter so the playtest surface stays the same and so we get a free
+UX win out of the existing code.
+
+New method `World::spawn_planet_in_orbit(cx, cy, radius, mat) ->
+Option<u32>` in `src/sim.rs`. It finds the first BlackHole in the
+world, computes the radial vector from BH to click point, returns
+`None` when `r < 1.0` (click on top of BH — `v_circ` would blow
+up), then calls the existing `spawn_planet` and applies:
+
+- `v_planet = v_circ · (−dy, dx) / r` — the CCW tangential
+  perpendicular of the radial vector (same direction the default
+  scenario uses at its +x starting position).
+- `Δv_BH = −(m_planet / m_BH) · v_planet` — equal-and-opposite
+  recoil so the system COM starts stationary (decision #19).
+
+Returns `None` if there is no BH, the click is on the BH, the
+material has no bonds, or the spawn footprint is fully occupied.
+`App::spawn_planet_at_cursor` in `src/app.rs` now calls the new
+method instead of `spawn_planet` directly.
+
+Tests added (3, all in `sim::tests`):
+
+- `spawn_planet_in_orbit_uses_v_circ_and_recoil` — the canonical
+  check: planet velocity is purely tangential with magnitude
+  `v_circ = sqrt(G*M_BH/r)`, BH recoil is opposite to planet
+  velocity, total system momentum is approximately 0.
+- `spawn_planet_in_orbit_returns_none_without_black_hole` — no
+  BH means nothing to orbit; no body should be spawned.
+- `spawn_planet_in_orbit_returns_none_on_top_of_bh` — click on
+  the BH itself returns `None` rather than injecting a NaN
+  velocity.
+
+Verification: 39 tests pass (was 36, +3), 3 ignored. Default-scenario
+dump at t=0/40/120/240/400/800 ticks is byte-for-byte identical to
+the Phase 2/Phase 3 baseline (BH at (136.73, 124.97) at t=400,
+planet at (78.8, 141.9) with mass 54) — the click-spawn path is
+not on the default scenario's hot path so the integration
+regression test stays green.
+
+Decision #28 added (click-spawn = tangential circular orbit + BH
+recoil, "first BH wins" for multi-BH scenes).
+
+**Playtest status:** the unit tests pass but the first MacBook
+visual playtest surfaced an OOB panic in `recompute_bonds` at
+`src/sim.rs:704`: a planet particle that had migrated to a
+corner cell like (255, 255) still carried a `BOND_SE` bit in
+its `bond_state` from when it was at a more central cell. The
+adjacency-time bounds check at the top of `recompute_bonds`
+validated the in-bounds neighbours but not the mirror-clear
+target, so the index `(256, 256)` panics. `recompute_bonds`
+now bounds-checks each mirror-clear target. The same class of
+bug also existed in `spawn_planet`'s disk-fill loop, which
+silently pushed OOB cells into `filled` when the click was
+near the edge and panicked in the body-index stamp loop. The
+fix skips OOB cells up front so a corner click produces a
+clipped (partial) planet instead of panicking. Five new tests
+in `sim::tests` cover all four edges plus the spawn edge
+(`recompute_bonds_does_not_panic_when_{n,e,ne,se}_neighbour_oob`,
+`spawn_planet_near_edge_does_not_panic`).
+
+**Next up:** user re-runs the MacBook visual playtest of
+click-spawn (this commit should be panic-free even for
+edge-corner clicks); PR #5 picks up the new commits; Phase 4
+(bodies as first-class objects with shape templates) remains
+the next major chunk of work.
+
+### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
+
+Built the Barnes-Hut quadtree path for body-particle gravity and
+integrated it into `move_pass`. New module `src/barnes_hut.rs`:
+flat `Vec<QuadNode>`, `QuadTree::new(bodies, theta)` builds the tree
+with bottom-up CoM computation, `compute_accel(p, theta)` walks the
+tree with the `s/d < theta` opening-angle criterion. Decisions
+#23–#27 in the Decisions Log.
+
+Integration in `src/sim.rs`: `move_pass` now builds a `QuadTree`
+once per tick (when `bodies.len() >= BARNES_HUT_THRESHOLD = 8`) and
+passes it to `gravity_step_for_cell_bh`, a tree-walking
+replacement for `gravity_step_for_cell`'s N² loop. Below the
+threshold the existing direct-sum path runs unchanged — the default
+scenario (1 BH + 1 planet = 2 bodies) and the Phase 2 perf sanity
+test (10 BHs without BH) are unaffected. Body-body gravity stays
+N² pairwise (decision #26); the event horizon ring
+(`stamp_event_horizon_ring`) is unchanged.
+
+Tests added (5 in `barnes_hut`, 3 in `sim`):
+
+- `barnes_hut::empty_bodies_yields_empty_tree`,
+  `single_body_tree_has_one_node`,
+  `two_distant_bodies_subdivide_root`,
+  `bh_matches_direct_sum_with_small_theta` (3-body tree, theta=0.1
+  — exact-answer check),
+  `bh_at_root_treats_as_point_mass_with_high_theta` (theta=100 —
+  root is the only node).
+- `sim::barnes_hut_matches_direct_sum_for_8_bodies` (8 BHs in a
+  ring; per-cell gravity matches direct sum to < 5% relative
+  error at theta=0.5).
+- `sim::barnes_hut_threshold_uses_direct_sum_below` (7 bodies —
+  threshold-boundary sanity check).
+- `sim::perf_sanity_100_bodies_50k_particles` (#[ignore]'d; 100
+  BHs in a ring, ~63k particles, 100 ticks; loose 200ms/tick
+  upper bound).
+
+Verification: 36 tests pass (was 29, +7), 3 ignored. Perf:
+
+| Scenario | ms/tick (release, dev box) | Budget | Status |
+|---|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a | unchanged |
+| 10 BHs + 65k particles (Barnes-Hut) | 7.4 | < 33 (30+ fps) | ✓ |
+| 100 BHs + 63k particles (Barnes-Hut) | 15.2 | < 33 (30+ fps) | ✓ |
+
+Both Phase 3 perf budgets met. The 10-body case is slightly
+slower than Phase 2's N² (7.4 vs 3.4 ms) because Barnes-Hut's
+constant factor (tree alloc, s/d branching) exceeds the O(N)
+saving at N=10 — this is exactly why the threshold exists. The
+default scenario's 1.5 ms/tick in the spec is unchanged
+(direct sum path).
+
+Default-scenario dump (the visual smoke test) at t=0/40/120/240/
+400/800 ticks matches the Phase 2 baseline to the digit: BH at
+(128, 128) → (136.7, 125.0) at t=400, planet at (78.8, 141.9)
+with mass=54 at t=400, mass=23 at t=800. The "tidal peel" visual
+is preserved because Barnes-Hut with theta=0.5 introduces only a
+small far-field error and the default scenario has only 2 bodies
+(no tree to walk). At 8+ bodies the per-cell gravity vector is
+within 5% of the direct sum, which is well below the threshold
+where the "tidal peel" would visibly smooth out.
+
+### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
+
+Landed the 9 follow-up items from the PR #4 review as a single
+cleanup commit on `feat/phase-3-barnes-hut` (immediately after
+branching from main, before Barnes-Hut work). One real bug, eight
+documentation/test nits. The whole list is preserved under
+"Phase 2 follow-ups (from PR #4 review)" with each item marked
+**Resolved (Session 6)** so the trail is auditable.
+
+Changes:
+
+- **Follow-up #1 (BLOCKER):** `apply_scenario` now rounds `(x, y)`
+  once and uses the rounded value for BOTH the particle disk
+  spawn and the body position. A non-integer CLI spec like
+  `planet:x=180.5,...` no longer leaves the body 0.5 cells off
+  center from its own mass. New test
+  `apply_scenario_rounds_body_position_to_particle_disk` guards
+  the regression.
+- **Follow-up #2:** `default_scenario` docstring now uses r=50
+  throughout (was r=40 in the math, r=50 in the code).
+- **Follow-up #3:** `app.rs` module docstring no longer calls the
+  default a "near-collision orbit" — it's a circular orbit with
+  COM-stationary init (decision #20).
+- **Follow-up #4:** SPEC Session 4 now reads "27 tests pass (was
+  24, +3), 2 ignored" (was incorrectly "30 tests pass").
+- **Follow-up #5:** `move_pass_does_not_lose_particles` test
+  comment now cites the commit message's measured 84-of-113
+  figure (was the speculative ~62).
+- **Follow-up #6:** `HANDOFF.md` now has Session 4 (BH-zoom fix)
+  AND Session 5 (Newton's 3rd law) entries consistent with the
+  SPEC session log.
+- **Follow-up #7:** Removed unused import `crate::body::Body`
+  and unused `initial_distance_sq` variable in the orbit test.
+  `cargo test` is warning-clean.
+- **Follow-up #8:** Deleted the vestigial comment in
+  `src/body.rs:11` (nothing referenced it).
+- **Follow-up #9:** `dump_default_scenario` now extends to t=800
+  (was t=400). SPEC Session 4 cites the measured end-of-run mass
+  instead of the speculative "~34" framing.
+
+Verification: 29 tests pass (was 28, +1), 2 ignored. No new
+decisions; the cleanup closes items the PR review caught and
+clears the path for Phase 3 (Barnes-Hut) work.
 
 ### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
 
@@ -396,15 +749,28 @@ planet on their MacBook. Three real bugs behind it:
 
 Tests added: `move_pass_does_not_lose_particles`,
 `leapfrog_does_not_gain_energy_in_pure_orbit`,
-`body_body_gravity_conserves_momentum`. **30 tests pass**, 2 ignored
-(visual dump + perf sanity).
+`body_body_gravity_conserves_momentum`. **27 tests pass** (was 24, +3),
+2 ignored (visual dump + perf sanity).
 
 Default scenario now: BH at (128, 128), mass=1000, v=(0, -0.045) (COM
 recoil); planet at (178, 128) on circular orbit r=50 with v=v_circ.
 COM stays at (133, 128); BH orbits the COM at radius 4 cells in a
-tight circle, which reads as "stationary" in the visual. Planet mass
-drops from 113 → ~34 over 800 ticks of tidal stripping but does not
-fully vanish.
+tight circle, which reads as "stationary" in the visual.
+
+Measured planet mass over time (from `dump_default_scenario` in
+`src/sim.rs`, release build, G=8e-3, M_BH=1000):
+
+| t (ticks) | planet mass |
+|---|---|
+| 0   | 113 |
+| 120 | 106 |
+| 240 | 82  |
+| 400 | 54  |
+| 800 | 23  |
+
+The planet does not fully vanish within 800 ticks; it loses
+roughly 8 particles per 100 ticks under the default orbital
+geometry.
 
 ### 2026-10-08 — Session 3: Phase 2 ships on `feat/phase-2-multi-body-gravity`
 
@@ -443,3 +809,31 @@ fully vanish.
 - Created repo at `~/Development/blackhole-sand/`, GitHub remote `klampatech/blackhole-sand`.
 - Wrote this SPEC, CI guard, HANDOFF stub.
 - Next: Phase 1 — wgpu window, single black hole, particle-by-particle disintegration.
+**Resolved (Session 6).** `apply_scenario` now rounds `(x, y)` once
+and uses the rounded value for both the particle spawn and the body
+position. New test `apply_scenario_rounds_body_position_to_particle_disk`
+guards against regression.
+**Resolved (Session 6).** Docstring numbers updated to match the
+code (r=50 throughout).
+**Resolved (Session 6).** Comment now says "circular orbit,
+COM-stationary init" and references SPEC decision #20.
+**Resolved (Session 6).** Session 4 now reads "27 tests pass
+(was 24, +3), 2 ignored".
+**Resolved (Session 6).** Comment now cites the commit message's
+measured 84-of-113 number instead of the speculative 62.
+**Resolved (Session 6).** Added Session 4 (BH-zoom fix) AND
+Session 5 (Newton's 3rd law) entries to HANDOFF.md.
+**Resolved (Session 6).** Removed unused import `crate::body::Body`
+from `sim.rs` tests; removed unused `initial_distance_sq` variable
+in the orbit test. `cargo test` is warning-clean.
+**Resolved (Session 6).** Comment deleted; nothing referenced it.
+**Resolved (Session 6).** `dump_default_scenario` now extends
+out to 800 ticks. SPEC Session 4 cites the measured value instead
+of the speculative "~34" framing.
+| 23 | 2026-10-09 | Phase 3: Barnes-Hut body-particle gravity with theta=0.5 | N² body-particle gravity is the bottleneck once we have 10+ bodies and 50k+ particles (the Phase 3 trigger). Barnes-Hut reduces the per-cell cost from O(N) to O(log N) on average by treating distant bodies as a point mass at their center of mass. theta=0.5 is the textbook default; the s/d < theta opening-angle criterion matches the spec. We did not sweep theta values — the spec is explicit that 0.5 is the right starting point and θ tuning happens in a follow-up if the user notices orbit drift at close encounters. | GPU Barnes-Hut (premature: tree build is small, ≤4000 nodes for 1000 bodies, and a sim→GPU migration is a Phase 4+ question; decision #8), multipole expansion (single-pole CoM is good enough at theta=0.5), HOT (overkill — Barnes-Hut gets us 10x, we'd need 100x to justify the complexity). |
+| 24 | 2026-10-09 | Phase 3: Barnes-Hut activates when `bodies.len() >= 8`; below that, direct sum | Below ~8 bodies, the constant factor of tree build + per-cell traversal exceeds the O(N) saving. Direct sum is a tight loop over a small slice; Barnes-Hut allocates a `Vec<QuadNode>`, walks child indices, and branches on `body_id.is_some()`. We measured 7.4 ms/tick for 10 bodies + 65k particles with the BH path on this dev box (the Phase 2 N² number for the same scenario was 3.4 ms/tick), so the crossover is somewhere between 10 and 100 bodies — for 100 bodies + 63k particles Barnes-Hut is at 15 ms/tick, well under the 33 ms budget. The default scenario (2 bodies) is unaffected. | Single path (use Barnes-Hut always: wastes cycles on the default scenario for no gain), higher threshold (16-32 would speed up the 10-body case but make no difference for 100+ bodies; 8 keeps the spec's "natural heuristic" and is conservative), lower threshold (1 or 2: would slow down the default scenario without measurable gain). |
+| 25 | 2026-10-09 | Phase 3: Barnes-Hut tree is rebuilt every tick, not incrementally | Bodies move every tick (Leapfrog integrates them) and the cost of incrementally updating the tree is on par with rebuilding from scratch at our scale (N ≤ 1000, max tree size 4N = 4000 nodes, build is O(N log N) = 10000 ops). Rebuilding simplifies the code: the tree is a snapshot of `self.bodies` at the start of `move_pass`, used by every cell, and dropped at the end of the tick. No parent tracking, no rebalancing, no stale-node bugs. | Incremental update (re-builds of subtrees when a body crosses a quadrant boundary; at our scale the bookkeeping cost exceeds the savings), periodic rebuild (rebuild every K ticks: introduces a staler-tree error budget we'd then have to reason about; simpler to just rebuild every tick). |
+| 26 | 2026-10-09 | Phase 3: body-body gravity stays N² pairwise | N bodies is bounded by Phase 4's body templates, so N² body-body gravity is at most 100×100 = 10,000 ops/tick — nothing. The Barnes-Hut tree is for body-particle gravity (which is N×M for N bodies and M particles, and M can be 50k+). | Apply Barnes-Hut to body-body too (the N² cost is 4 orders of magnitude below body-particle; would just add branching and reduce clarity). |
+| 27 | 2026-10-09 | Phase 3: Barnes-Hut tree uses Plummer softening identical to Phase 2 (`d² -> d² + SOFTENING_SQ = d² + 0.25`) | Consistency with the Phase 2 spec. The softening goes into the magnitude (`a_mag = G * M / d²` uses the softened `d²`) but the opening-angle test uses the unsoftened distance so it matches the textbook Barnes-Hut criterion. The visual signature of close encounters is preserved because softening is what keeps the per-cell gravity vector from blowing up near a body. | Hard cutoff (looks unnatural; bodies "skip" past each other — same as Phase 2's rejected option for direct sum), no softening in the tree (numerical instability when two bodies are very close: their CoM is in the same cell and the softened magnitude still overflows). |
+| 28 | 2026-10-09 | Phase 3: click-spawned planets are initialized on a tangential circular orbit around the first BlackHole (`v_circ = sqrt(G * M_BH / r)`, CCW perpendicular to the radial vector), with equal-and-opposite recoil on the BH so the system starts COM-stationary | Phase 1/2 click-spawn used `spawn_planet(cx, cy, ...)` which left the planet at v=(0,0); on the MacBook playtest the user saw the planet fall straight into the BH instead of orbiting — confusing because the default scenario clearly does orbit. Aligning click-spawn with the default scenario (decision #19 + decision #20) means the click-to-orbit interaction matches what the playtest expects. The “first BH wins” rule is good enough because click-spawn is overwhelmingly tested with the single-BH default scenario; if multi-BH scenes become a thing we can revisit with “nearest BH”. Returns `None` when there is no BH, the click is on top of a BH (r near 0), or the spawn footprint is fully occupied. | Disable click-spawn (it’s the visible interaction, disabling would lose user-visible behavior for a UX miss), keep `spawn_planet` and accept the v=0 free-fall (the bug we’re fixing), pick the *nearest* BH (more intuitive for multi-BH scenes but adds bookkeeping for a case we don’t exercise yet). |
+> **Status:** Phase 3 (Barnes-Hut) landed on `feat/phase-3-barnes-hut` (commits `e0409b0` + this commit). PR + review pending.

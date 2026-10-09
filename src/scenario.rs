@@ -135,12 +135,12 @@ fn parse_fields(s: &str) -> Result<std::collections::HashMap<String, f32>, Scena
 /// Tuned so a `cargo run` immediately shows an orbiting planet and the
 /// BH stays essentially still:
 /// * BH at grid center, mass 1000.
-/// * Planet at distance 40 cells to the right of the BH, radius 6 cells
+/// * Planet at distance 50 cells to the right of the BH, radius 6 cells
 ///   (~ 113 particles, mass=113), tangential velocity equal to the
-///   circular velocity at r=40: v_circ = sqrt(G*M/r) = sqrt(8e-3*1000/40)
-///   = sqrt(0.2) = 0.447 cells/tick.
-/// * The orbit period is 2*pi*sqrt(r^3 / G*M) = 2*pi*sqrt(64000/8) =
-///   2*pi*89.4 ≈ 562 ticks (~9.4s @ 60fps). Comfortable to watch.
+///   circular velocity at r=50: v_circ = sqrt(G*M/r) = sqrt(8e-3*1000/50)
+///   = sqrt(0.16) = 0.4 cells/tick.
+/// * The orbit period is 2*pi*sqrt(r^3 / G*M) = 2*pi*sqrt(125000/8) =
+///   2*pi*125.0 ≈ 785 ticks (~13.1s @ 60fps). Comfortable to watch.
 /// * The BH orbits the system COM (a tiny 0.4-cell radius) — essentially
 ///   stationary in screen pixels thanks to the 9:1 BH:planet mass
 ///   ratio. The user sees the planet sweep around a fixed BH.
@@ -190,9 +190,17 @@ pub fn apply_scenario(world: &mut World, specs: &[BodySpec]) {
                 let _ = world.spawn_black_hole(*x, *y, *mass);
             }
             BodySpec::Planet { x, y, radius, vx, vy } => {
+                // Round (x, y) once and use the rounded value for BOTH
+                // the particle disk spawn AND the body position. Mixing
+                // the two creates a 0.5-cell offset between the body's
+                // own position and its particle mass — the body sits
+                // up to 0.5 cells off-center from its own gravity
+                // source, which biases every gravity computation. See
+                // SPEC.md "Phase 2 follow-ups" item 1.
+                let (xr, yr) = (x.round(), y.round());
                 let pid = world.spawn_planet(
-                    x.round() as i32,
-                    y.round() as i32,
+                    xr as i32,
+                    yr as i32,
                     *radius,
                     crate::material::Material::Rock as u8,
                 );
@@ -201,7 +209,7 @@ pub fn apply_scenario(world: &mut World, specs: &[BodySpec]) {
                 // particle disk center for clean physics.
                 if pid != crate::sim::NO_BODY as u32 {
                     if let Some(b) = world.bodies.iter_mut().find(|b| b.id == pid) {
-                        b.position = glam::Vec2::new(*x, *y);
+                        b.position = glam::Vec2::new(xr, yr);
                         b.velocity = glam::Vec2::new(*vx, *vy);
                     }
                 }
@@ -305,5 +313,29 @@ mod tests {
         assert!(w.bodies[0].destroys_particles());
         assert!(!w.bodies[1].destroys_particles());
         close(w.bodies[1].velocity.y, 0.5);
+    }
+
+    #[test]
+    fn apply_scenario_rounds_body_position_to_particle_disk() {
+        // Regression for SPEC "Phase 2 follow-ups" item 1 (the
+        // BLOCKER). A non-integer CLI spec like
+        // `planet:x=180.5,y=128.0,...` previously caused a 0.5-cell
+        // offset between the body's own `position` and the integer
+        // center of its particle disk. The body sat up to half a
+        // cell off from its own mass, biasing every gravity
+        // computation. Fix: round (x, y) once and use the rounded
+        // value for BOTH the particle spawn AND the body position.
+        let mut w = World::new();
+        let specs = parse_bodies("planet:x=180.5,y=128.5,r=6,vx=0,vy=0").unwrap();
+        apply_scenario(&mut w, &specs);
+        // The Planet body is the only body spawned.
+        let planet = w.bodies.iter().find(|b| !b.destroys_particles()).unwrap();
+        // Body position should match the integer cell at the center
+        // of the particle disk, not the unrounded (180.5, 128.5).
+        assert_eq!(planet.position.x, 181.0);
+        assert_eq!(planet.position.y, 129.0);
+        // And the particle disk should be centered at that integer
+        // cell: cells at (181, 129) must be filled.
+        assert_ne!(w.get(181, 129), 0, "particle disk not at body position");
     }
 }

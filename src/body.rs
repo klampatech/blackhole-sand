@@ -8,8 +8,6 @@
 //!
 //! See `docs/phase-2-multi-body-gravity.md` for the design rationale.
 
-// (H, W are referenced from sim.rs via the W/H re-exports; this import is unused.)
-
 /// f32 2D vector. Bodies live in *grid* coordinates, so position `(128.0,
 /// 64.5)` means "cell column 128, halfway between rows 64 and 65". The
 /// particle grid is coarser — particles snap to the nearest integer cell.

@@ -4,9 +4,9 @@
 //!
 //! Phase 2: App::new accepts an optional scenario. When supplied, the
 //! bodies from the scenario replace the default. When not, we use the
-//! default scenario (1 BH at grid center + 1 planet on a near-collision
-//! orbit) and also seed a thin rain of particles so the user sees the
-//! falling-sand effect.
+//! default scenario (1 BH at grid center + 1 planet on a circular
+//! orbit, COM-stationary init — see SPEC decision #20) and also seed
+//! a thin rain of particles so the user sees the falling-sand effect.
 //!
 //! ## Input mapping (Phase 2)
 //!   * Left-click  — spawn a new Rock planet at the cursor (added to the
@@ -87,7 +87,15 @@ impl App {
     fn spawn_planet_at_cursor(&mut self) {
         if let Some(pos) = self.input.cursor_phys {
             if let Some((cx, cy)) = self.cursor_to_cell(pos) {
-                self.world.spawn_planet(cx, cy, 10, Material::Rock as u8);
+                // spawn_planet_in_orbit places the planet on a
+                // tangential circular orbit around the first BH
+                // (v_circ, COM-stationary init — decision #19).
+                // Without this, click-spawned planets are born with
+                // v=(0,0) and fall straight into the BH, which
+                // confuses the playtest (Session 8).
+                self.world.spawn_planet_in_orbit(
+                    cx, cy, 10, Material::Rock as u8,
+                );
             }
         }
     }
