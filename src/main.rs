@@ -4,6 +4,7 @@
 //! planet and watch it get torn apart by the central black hole.
 
 mod app;
+mod body;
 mod material;
 mod sim;
 mod state;
