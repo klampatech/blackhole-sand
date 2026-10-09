@@ -151,6 +151,29 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 - **Bodies: emergent vs first-class?** Phase 1 is emergent. Phase 4 makes them explicit. Decision deferred.
 - **Save/load?** Not in any phase yet. Defer to Phase 4+.
 
+## Phase 2 implementation notes
+
+- **Mass unit:** `1 mass unit = 1 particle of Rock`. A planet's mass equals
+  its current `particle_budget × 1.0`. A BlackHole's mass is set explicitly
+  at spawn (the BH is a point mass, not a particle cluster).
+- **Sticky bonds:** `bond_state: Vec<u8>` is the lifetime bond bitmask. New
+  bonds are set only on planet spawn; bond breaks clear bits in
+  `bond_state` permanently. Active bonds each tick =
+  `bond_state & current_adjacency`. (See decision #10.)
+- **Body ownership:** each grid cell stores `body_index: i32` (default `-1`).
+  Spawned planets stamp their `id` into all cells they fill; event-horizon
+  destruction decrements the owning body's `particle_budget`.
+- **Event horizon:** BlackHole bodies destroy particles whose grid cell
+  lies within `event_horizon_radius` (default 3 cells). Visualized as a
+  faint purple ring of `EventHorizon` cells (new material #4).
+- **Body radius semantics:** `Body.radius` is for *event horizon / visual
+  circle*, not collision. Body-body collision is Phase 4. Phase 2 bodies
+  are point masses.
+- **Particle sub-cell positions?** Still integer grid cells. Bodies live
+  at f32 sub-cell resolution. The differential motion that drives tidal
+  peeling comes from per-particle gravity recomputation, not from
+  sub-cell particle positions.
+
 ---
 
 ## Acceptance Criteria (per phase)
@@ -159,7 +182,7 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 |---|---|---|
 | 0 | IN PROGRESS | `git clone` the repo, see this file, CI is green. |
 | 1 | TODO | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
-| 2 | TODO | Place 2+ bodies, see real orbital mechanics. |
+| 2 | IN PROGRESS | Place 2+ bodies, see real orbital mechanics. |
 | 3 | TODO | 10k+ particles at 30+ fps. |
 | 4 | TODO | "Place planet" is a primitive with mass/velocity. |
 | 5 | TODO | Playable game with levels. |
