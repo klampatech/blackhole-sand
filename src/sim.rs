@@ -151,11 +151,20 @@ impl World {
         self.next_body_id += 1;
 
         // Fill the disk and remember the filled cells so we can stamp
-        // bond_state + body_index in a second pass.
+        // bond_state + body_index in a second pass. Skip OOB cells
+        // up front: a click near the edge of the grid would
+        // otherwise push (x, y) tuples outside [0, W) × [0, H)
+        // onto `filled`, and the next loop indexes them as
+        // `Self::idx(x as usize, y as usize)` which panics on an
+        // OOB index. `self.set` and `self.get` are bounds-safe on
+        // their own, so the disk naturally clips to the grid.
         let r2 = radius * radius;
         let mut filled: Vec<(i32, i32)> = Vec::new();
         for y in (cy - radius)..=(cy + radius) {
             for x in (cx - radius)..=(cx + radius) {
+                if !Self::in_bounds(x, y) {
+                    continue;
+                }
                 let dx = x - cx;
                 let dy = y - cy;
                 if dx * dx + dy * dy > r2 {
@@ -687,25 +696,36 @@ impl World {
                     // And mirror-clear the corresponding bits on the
                     // neighbour cell. For each newly-broken direction,
                     // find the neighbour and clear the mirror bit.
-                    if newly_broken & BOND_N != 0 {
-                        let j = Self::idx(x, y - 1);
-                        self.bond_state[j] &= !BOND_S; // mirror of N is S on the cell below
-                    }
-                    if newly_broken & BOND_E != 0 {
-                        let j = Self::idx(x + 1, y);
-                        self.bond_state[j] &= !BOND_W; // mirror of E is W on the cell right
-                    }
-                    if newly_broken & BOND_NE != 0 {
-                        let j = Self::idx(x + 1, y - 1);
-                        self.bond_state[j] &= !BOND_SW; // mirror of NE is SW
-                    }
-                    if newly_broken & BOND_SE != 0 {
-                        let j = Self::idx(x + 1, y + 1);
-                        self.bond_state[j] &= !BOND_NW; // mirror of SE is NW
-                    }
+                // Each mirror-clear targets a specific neighbour cell.
+                // The bond bit can outlive its neighbour's bounds:
+                // `move_pass` transports `bond_state` around with the
+                // particle, so a planet particle can carry a `BOND_SE`
+                // bit (set at spawn when its (x+1, y+1) neighbour was
+                // in bounds) into a corner cell where the neighbour is
+                // now OOB. The adjacency check at the top of this
+                // function only validates neighbours that ARE in bounds
+                // — it does not tell us whether the bond was set when
+                // they were. Bounds-check each mirror target here to
+                // avoid an OOB panic on the index.
+                if newly_broken & BOND_N != 0 && y > 0 {
+                    let j = Self::idx(x, y - 1);
+                    self.bond_state[j] &= !BOND_S; // mirror of N is S on the cell below
+                }
+                if newly_broken & BOND_E != 0 && x + 1 < W {
+                    let j = Self::idx(x + 1, y);
+                    self.bond_state[j] &= !BOND_W; // mirror of E is W on the cell right
+                }
+                if newly_broken & BOND_NE != 0 && y > 0 && x + 1 < W {
+                    let j = Self::idx(x + 1, y - 1);
+                    self.bond_state[j] &= !BOND_SW; // mirror of NE is SW
+                }
+                if newly_broken & BOND_SE != 0 && y + 1 < H && x + 1 < W {
+                    let j = Self::idx(x + 1, y + 1);
+                    self.bond_state[j] &= !BOND_NW; // mirror of SE is NW
                 }
             }
         }
+    }
     }
 
     /// Paint a faint purple ring of `EventHorizon` cells around every
@@ -1689,6 +1709,108 @@ mod tests {
         );
         // Only the BH should be in the world.
         assert_eq!(w.bodies.len(), 1);
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_se_neighbour_oob() {
+        // Regression test for an OOB panic in the sticky-bond
+        // mirror-clear path. A planet particle can carry a BOND_SE
+        // bit in its bond_state from when it was at a more central
+        // cell (where (x+1, y+1) was in bounds) into a corner
+        // cell like (255, 255) where (256, 256) is OOB. The
+        // adjacency check at the top of `recompute_bonds` only
+        // validates neighbours that are in bounds; it does not
+        // tell us whether the bond was set when they were. Without
+        // an explicit bounds-check on the mirror-clear target the
+        // index panics with `index out of bounds: the len is
+        // 65536 but the index is 65772`. This test reproduces
+        // the exact bug state: a single particle at (255, 255)
+        // with a stale BOND_SE bit. recompute_bonds must drop the
+        // broken bit on bond_state[i] without trying to mirror-
+        // clear into the OOB neighbour.
+        let mut w = World::new();
+        w.particles[World::idx(255, 255)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 255)] = BOND_SE;
+        w.recompute_bonds();
+        // The broken bit must have been cleared from bond_state.
+        assert_eq!(
+            w.bond_state[World::idx(255, 255)], 0,
+            "BOND_SE should be cleared when (256, 256) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_n_neighbour_oob() {
+        // Same class of bug, but for the BOND_N bit at the top
+        // edge. A particle at (0, 0) can carry a stale BOND_N
+        // bit. recompute_bonds would try to mirror-clear into
+        // (0, -1), which underflows the y index on usize.
+        let mut w = World::new();
+        w.particles[World::idx(0, 0)] = Material::Rock as u8;
+        w.bond_state[World::idx(0, 0)] = BOND_N;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(0, 0)], 0,
+            "BOND_N should be cleared when (0, -1) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_e_neighbour_oob() {
+        // Same class of bug, but for the BOND_E bit at the right
+        // edge. A particle at (255, 128) with stale BOND_E.
+        let mut w = World::new();
+        w.particles[World::idx(255, 128)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 128)] = BOND_E;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(255, 128)], 0,
+            "BOND_E should be cleared when (256, 128) is OOB"
+        );
+    }
+
+    #[test]
+    fn recompute_bonds_does_not_panic_when_ne_neighbour_oob() {
+        // Same class of bug, but for the BOND_NE bit at the top-
+        // right corner. A particle at (255, 0) with stale BOND_NE.
+        let mut w = World::new();
+        w.particles[World::idx(255, 0)] = Material::Rock as u8;
+        w.bond_state[World::idx(255, 0)] = BOND_NE;
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[World::idx(255, 0)], 0,
+            "BOND_NE should be cleared when (256, -1) is OOB"
+        );
+    }
+
+    #[test]
+    fn spawn_planet_near_edge_does_not_panic() {
+        // Regression test for a spawn-time OOB panic. The disk-
+        // fill loop in `spawn_planet` iterated over a square
+        // (cx - radius) ..= (cx + radius) without bounds checks
+        // and pushed OOB (x, y) tuples into `filled`. The next
+        // loop then indexed `Self::idx(x as usize, y as usize)`
+        // for those tuples, panicking on `self.body_index[i] =`.
+        // A click at the corner of the grid with radius=10
+        // triggered this. The fix skips OOB cells up front, so
+        // the planet just clips to the grid — partial planet,
+        // no panic.
+        let mut w = World::new();
+        let pid = w.spawn_planet(255, 255, 10, Material::Rock as u8);
+        assert_eq!(pid, 0, "first body should get id 0");
+        // The planet should exist and have at least the center cell.
+        let p = w.bodies.iter().find(|b| b.id == pid).unwrap();
+        assert!(p.mass > 0.0, "planet should have at least one particle");
+        // No OOB indices should have been written.
+        for y in 0..H {
+            for x in 0..W {
+                let i = World::idx(x, y);
+                if w.particles[i] != 0 {
+                    assert!(w.body_index[i] == pid as i32 || w.body_index[i] == NO_BODY,
+                        "unexpected body_index at ({x}, {y})");
+                }
+            }
+        }
     }
 
 }

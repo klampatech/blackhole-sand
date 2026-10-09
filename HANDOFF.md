@@ -42,10 +42,21 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 - 39 tests pass (was 36, +3), 3 ignored. Default-scenario dump is
   byte-for-byte identical to the Phase 2/3 baseline
   (BH=(136.73, 124.97) at t=400). `cargo build` is warning-clean.
-- **Playtest status:** code compiles and the new unit tests pass,
-  but the user has not yet re-run the MacBook visual playtest of
-  click-spawn. Next step is `cargo run` and clicking anywhere
-  off-center to confirm the planet now orbits the BH.
+- **Playtest fix (same session):** first visual playtest surfaced
+  an OOB panic in `recompute_bonds` at `src/sim.rs:704`: a
+  planet particle migrating to (255, 255) still carried a
+  `BOND_SE` bit in its `bond_state` from when it was at a
+  more central cell; the adjacency bounds check didn't apply
+  to the mirror-clear target. Same class of bug existed in
+  `spawn_planet`'s disk-fill loop (pushed OOB cells when the
+  click was near the edge, panicked in the body-index stamp).
+  Both fixed: `recompute_bonds` now bounds-checks each
+  mirror-clear target; `spawn_planet` skips OOB cells up
+  front. Five new tests in `sim::tests` cover all four edges
+  plus the spawn edge.
+- 44 tests pass (was 39, +5), 3 ignored. Default-scenario
+  dump is byte-for-byte identical to the Phase 2/3 baseline.
+  `cargo build` is warning-clean.
 
 ### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
 

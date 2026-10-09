@@ -548,15 +548,29 @@ regression test stays green.
 Decision #28 added (click-spawn = tangential circular orbit + BH
 recoil, "first BH wins" for multi-BH scenes).
 
-**Playtest status:** the new method compiles clean and passes unit
-tests, but the user has not yet re-run the MacBook visual playtest
-of click-spawn. That's the next step: `cargo run`, click anywhere
-off-center, and confirm the planet now orbits the BH instead of
-free-falling.
+**Playtest status:** the unit tests pass but the first MacBook
+visual playtest surfaced an OOB panic in `recompute_bonds` at
+`src/sim.rs:704`: a planet particle that had migrated to a
+corner cell like (255, 255) still carried a `BOND_SE` bit in
+its `bond_state` from when it was at a more central cell. The
+adjacency-time bounds check at the top of `recompute_bonds`
+validated the in-bounds neighbours but not the mirror-clear
+target, so the index `(256, 256)` panics. `recompute_bonds`
+now bounds-checks each mirror-clear target. The same class of
+bug also existed in `spawn_planet`'s disk-fill loop, which
+silently pushed OOB cells into `filled` when the click was
+near the edge and panicked in the body-index stamp loop. The
+fix skips OOB cells up front so a corner click produces a
+clipped (partial) planet instead of panicking. Five new tests
+in `sim::tests` cover all four edges plus the spawn edge
+(`recompute_bonds_does_not_panic_when_{n,e,ne,se}_neighbour_oob`,
+`spawn_planet_near_edge_does_not_panic`).
 
-**Next up:** user confirms the visual; PR #5 picks up the new
-commit; Phase 4 (bodies as first-class objects with shape
-templates) remains the next major chunk of work.
+**Next up:** user re-runs the MacBook visual playtest of
+click-spawn (this commit should be panic-free even for
+edge-corner clicks); PR #5 picks up the new commits; Phase 4
+(bodies as first-class objects with shape templates) remains
+the next major chunk of work.
 
 ### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
 
