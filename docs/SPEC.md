@@ -184,6 +184,128 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
   at f32 sub-cell resolution. The differential motion that drives tidal
   peeling comes from per-particle gravity recomputation, not from
   sub-cell particle positions.
+- **Body-particle position alignment on spawn:** the gravity solver
+  reads a body's `position` and computes the per-cell gravity vector
+  from there. The particle disk is filled at integer cells (rounded
+  from the spawn spec). If a CLI spec like `planet:x=180.5,y=128,...`
+  is passed, the particles land at (180, 128) but the body sits at
+  (180.5, 128.0) — half a cell off from its own mass. This creates a
+  0.5-cell gravity bias that compounds over hundreds of ticks. See
+  Phase 2 follow-up §"Body-particle position alignment".
+
+---
+
+## Phase 2 follow-ups (from PR #4 review)
+
+These are issues the PR review caught but didn't block on. They should
+land as small follow-up commits on `feat/phase-2-multi-body-gravity`
+(or on a new branch off the merged main) before Phase 3 work begins.
+
+### 1. Body-particle position alignment on CLI spawn [BLOCKER]
+
+**Problem:** `apply_scenario` in `src/scenario.rs:194-207` rounds
+`(x, y)` to int for `spawn_planet` (so the particle disk lands at
+integer cells) but then sets `body.position` to the **unrounded**
+`(x, y)`. For a non-integer CLI spec the body sits up to 0.5 cells
+off-center from its own particle mass. The default scenario is
+immune (it uses integer coords) but `--bodies "planet:x=180.5,..."`
+triggers it.
+
+**Fix options (pick one):**
+- **(A) Round both.** `apply_scenario` calls `.round()` on `(x, y)`
+  once and uses the rounded value for both the particle spawn
+  AND the body position. Simple, consistent with the spec's
+  "Bodies live in grid cells" framing for the integer-coord case
+  (the f32 body type is incidental — it's there to support
+  sub-cell motion *during* the sim, not at spawn).
+- **(B) Accept sub-cell body positions, document it, and add a
+  test that the spec-parser round-trip preserves the fractional
+  part.** Update the "Body sub-cell positions" note in the
+  implementation notes to be unambiguous: "Bodies can spawn at
+  f32 sub-cell positions, decoupled from the integer-cell
+  particle disk. The 0.5-cell offset is intentional and is
+  bounded by the planet's spawn radius (the particle disk covers
+  a radius-N ball around the integer-rounded cell)."
+
+**Recommendation:** Option (A) for now. The spec says bodies live
+at integer cells in the spawn sense; sub-cell f32 is for *motion
+during* the sim (so a body at integer cell 100 can drift to
+100.3 over many ticks). Mixing the two at spawn-time creates the
+geometry gap. Sub-cell motion is preserved; sub-cell spawn is
+not needed for any current spec.
+
+**Test:** add `apply_scenario_rounds_body_position_to_particle_disk`
+to `src/scenario.rs` tests. Pass a `BodySpec::Planet { x: 180.5, ... }`
+and assert that the spawned body's `position` matches the integer
+cell at the center of the particle disk, not the unrounded `x`.
+
+### 2. Docstring numerical drift in `default_scenario` [nit]
+
+`src/scenario.rs:139-146` docstring computes v_circ and period at
+**r=40**, but the code uses **r=50**. The math is correct for the
+wrong radius. Pick one: either change the docstring to use r=50
+(v_circ = sqrt(0.16) = 0.4, period = 2*pi*sqrt(125000/8) ≈ 785
+ticks), or change the code to r=40 (slower orbit, tidier numbers
+in the docstring). Recommend: change the docstring to match the
+code. The orbital shape is identical either way.
+
+### 3. Stale "near-collision orbit" reference in `app.rs` [nit]
+
+`src/app.rs:7` says default is "1 BH at grid center + 1 planet on
+a near-collision orbit" — the OLD default. The current default is
+a circular orbit with COM-stationary init (per decision #20).
+Update to match.
+
+### 4. Test count mismatch in SPEC Session 4 [nit]
+
+`docs/SPEC.md:237` (Session 4) says "30 tests pass" — actual is
+**27** pass, 2 ignored. The 3 new tests in 981a906 bring it from
+24 to 27. Fix the number.
+
+### 5. Test comment number drift in `move_pass_does_not_lose_particles` [nit]
+
+`src/sim.rs:1022` says "without the fix ~62 particles vanish" —
+the commit message in 981a906 says "Up to 84 of 113 particles in
+the default scenario between t=0 and t=200". Pick one number.
+Recommend: keep the commit message's 84 (it's the measured number
+at t=200) and rephrase the test comment to "without the fix a
+large fraction of a planet's particles can vanish during a close
+encounter — measured at 84 of 113 by t=200 in the default scenario".
+
+### 6. Missing Session 4 entry in `HANDOFF.md` [nit]
+
+HANDOFF.md ends at Session 3 (Phase 2 ships). SPEC.md has the
+Session 4 entry for the BH-zoom fix. Add a HANDOFF Session 4
+entry consistent with the SPEC entry — same content, condensed
+to the HANDOFF format (4-5 bullets max per session).
+
+### 7. Compiler warnings in tests [nit]
+
+Two test-only warnings:
+- `src/sim.rs:651` — `unused import: crate::body::Body`
+- `src/sim.rs:910` — `unused variable: initial_distance_sq`
+
+Remove or `#[allow(unused)]`. They are test-only so harmless
+but rustc is right.
+
+### 8. Vestigial comment in `src/body.rs:11` [nit]
+
+`// (H, W are referenced from sim.rs via the W/H re-exports; this
+import is unused.)` — there is no actual import above or below
+this comment. Looks like a leftover from a refactor. Delete the
+comment.
+
+### 9. SPEC Session 4 "Planet mass drops to ~34 over 800 ticks" [nit]
+
+`docs/SPEC.md:243` says "Planet mass drops from 113 → ~34 over
+800 ticks of tidal stripping but does not fully vanish." The
+dump test only runs to 400 ticks (mass=46). Either run the
+test out to 800 ticks and report the actual number, or remove
+the speculative "~34" framing and say "mass drops continuously
+via tidal stripping". Recommend: extend the dump test to 800
+ticks and replace the ~34 with the actual measurement. This is
+the kind of number that's easy to verify and will get copy-pasted
+into a tutorial later.
 
 ---
 
