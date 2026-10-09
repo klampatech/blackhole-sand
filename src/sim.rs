@@ -589,6 +589,42 @@ mod tests {
     }
 
     #[test]
+    fn planet_disintegrates_under_tidal_pull() {
+        let mut w = World::new();
+        // Spawn a BlackHole at grid center and a small planet close to
+        // (but not on top of) it. Verify that the planet's center of
+        // mass migrates toward the BH over many ticks — i.e. the
+        // Phase 2 gravity path is wired up.
+        w.spawn_black_hole(HOLE_X as f32, HOLE_Y as f32, 1000.0);
+        w.spawn_planet(HOLE_X + 60, HOLE_Y, 6, Material::Rock as u8);
+        let start_dx = 60i64;
+        for _ in 0..80 {
+            w.step();
+        }
+        let (mut sx, mut sy, mut sn) = (0i64, 0i64, 0i64);
+        for y in 0..H {
+            for x in 0..W {
+                if w.particles[World::idx(x, y)] != 0 {
+                    sx += x as i64;
+                    sy += y as i64;
+                    sn += 1;
+                }
+            }
+        }
+        assert!(sn > 0, "planet vanished entirely (initial {} particles)", w.bodies.iter().map(|b| b.particle_budget).sum::<u32>());
+        let cx = sx / sn;
+        let cy = sy / sn;
+        let dx = cx - HOLE_X as i64;
+        let dy = cy - HOLE_Y as i64;
+        let d2 = dx * dx + dy * dy;
+        let start_d2 = start_dx * start_dx;
+        assert!(
+            d2 < start_d2,
+            "planet center of mass did not migrate toward the hole (d^2={d2}, start d^2={start_d2})"
+        );
+    }
+
+    #[test]
     fn sticky_bonds_do_not_reform_after_break() {
         let mut w = World::new();
         let pid = w.spawn_planet(50, 50, 3, Material::Rock as u8);
