@@ -1,6 +1,0 @@
-            .filter((x, y)|b| b.destroys_particles())
-            .filter((x, y)|b| b.destroys_particles())
-            .filter((x, y)|&(x, y)| w.particles[World::idx(x, y)] != 0)
-            .filter((x, y)|&(x, y)| w.particles[World::idx(x, y)] != 0)
-        let initial = w.particles.iter().filter((x, y)|&&m| m != 0).count();
-            .filter((x, y)|&(x, y)| w.particles[World::idx(x, y)] != 0)
