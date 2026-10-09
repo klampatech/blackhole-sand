@@ -929,4 +929,60 @@ mod tests {
             "mass should track particle_budget"
         );
     }
+    #[test]
+    #[ignore] // run with `cargo test perf_sanity -- --ignored --nocapture`
+    fn perf_sanity_10_bodies_full_grid() {
+        // Sanity check: 10 bodies + 50k randomly-distributed particles,
+        // 100 ticks. Should run in well under 1s on the gaming rig
+        // (target 30+ fps = <33ms/tick) and under 2s on m5
+        // (15+ fps = <67ms/tick). Prints wall time; the assert is loose
+        // so the test passes even on a slow CI box.
+        use std::time::Instant;
+        let mut w = World::new();
+        // Spawn 10 BHs in a ring at radius 80 around grid center.
+        for i in 0..10 {
+            let angle = (i as f32) * 0.628;
+            let r = 80.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        // Fill the grid (65k particles). Avoid the BH event horizons
+        // so we start with no destroyed particles.
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                // Skip cells inside any BH event horizon.
+                let mut inside = false;
+                for b in &w.bodies {
+                    if !b.destroys_particles() { continue; }
+                    let dx = (x as f32 - b.position.x) as f32;
+                    let dy = (y as f32 - b.position.y) as f32;
+                    if dx * dx + dy * dy < b.radius * b.radius {
+                        inside = true;
+                        break;
+                    }
+                }
+                if inside { continue; }
+                w.set(x, y, Material::Rock as u8);
+                w.body_index[World::idx(x as usize, y as usize)] = NO_BODY;
+            }
+        }
+        let particle_count = w.particles.iter().filter(|&&m| m != 0).count();
+        eprintln!("perf: 10 BHs + {} particles", particle_count);
+        let t = Instant::now();
+        for _ in 0..100 {
+            w.step();
+        }
+        let elapsed = t.elapsed();
+        let ms_per_tick = elapsed.as_secs_f64() * 1000.0 / 100.0;
+        eprintln!(
+            "perf: 10 bodies + full grid, 100 ticks in {:.1}ms ({:.2}ms/tick)",
+            elapsed.as_secs_f64() * 1000.0,
+            ms_per_tick
+        );
+        assert!(ms_per_tick < 500.0, "perf budget blown: {ms_per_tick:.2}ms/tick");
+    }
+
 }
