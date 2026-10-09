@@ -702,6 +702,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // run with `cargo test dump_default -- --ignored --nocapture`
+    fn dump_default_scenario() {
+        // Visual smoke test for the Phase 2 default scenario: 1 BH at
+        // grid center, 1 planet 60 cells right with v=(0, 0.5). Dumps
+        // RGBA at t=0/40/120/240/400 to /tmp/bhsand_p2_t*.bin so the
+        // user can confirm the slingshot + disintegration visual reads.
+        use crate::scenario::default_scenario;
+        use std::io::Write;
+        let checkpoints = [0usize, 40, 120, 240, 400];
+        for &n in &checkpoints {
+            let mut ww = World::new();
+            default_scenario(&mut ww);
+            for _ in 0..n {
+                ww.step();
+            }
+            let mut rgba = vec![0u8; W * H * 4];
+            ww.render_rgba(&mut rgba);
+            let path = format!("/tmp/bhsand_p2_t{n:03}.bin");
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&rgba).unwrap();
+            let planet = ww.bodies.iter().find(|b| !b.destroys_particles()).unwrap();
+            eprintln!(
+                "t={n:>3}: planet at ({:.1},{:.1}) v=({:.2},{:.2}) mass={:.0}",
+                planet.position.x, planet.position.y, planet.velocity.x, planet.velocity.y,
+                planet.mass
+            );
+        }
+    }
+
+    #[test]
     fn black_hole_destroys_particles_within_event_horizon() {
         let mut w = World::new();
         // Spawn a BH at the center and a planet adjacent to it.
