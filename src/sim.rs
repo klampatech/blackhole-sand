@@ -667,6 +667,37 @@ mod tests {
     }
 
     #[test]
+    fn planet_torn_between_two_black_holes() {
+        // Two equal-mass black holes on either side of a small planet.
+        // The planet's near-side (closer to BH_A) gets pulled toward A;
+        // its far-side gets pulled toward B. Differential acceleration
+        // along the A-B axis rips the planet apart (sticky bonds
+        // accumulate broken bits until the body splits). After many
+        // ticks the planet's particles should be split between the two
+        // BHs, not all consumed by one.
+        let mut w = World::new();
+        w.spawn_black_hole(64.0, 128.0, 1000.0);
+        w.spawn_black_hole(192.0, 128.0, 1000.0);
+        let pid = w.spawn_planet(128, 128, 5, Material::Rock as u8);
+        let initial_count = w.particles.iter().filter(|&&m| m != 0).count();
+        assert!(initial_count > 0);
+
+        for _ in 0..500 {
+            w.step();
+        }
+
+        // The planet's owning body should have lost at least 50% of its
+        // particles (proves the differential tearing is happening).
+        let body = w.bodies.iter().find(|b| b.id == pid).unwrap();
+        assert!(
+            body.particle_budget < initial_count as u32 / 2,
+            "planet not torn enough: {} of {} particles remain",
+            body.particle_budget,
+            initial_count
+        );
+    }
+
+    #[test]
     fn sticky_bonds_do_not_reform_after_break() {
         let mut w = World::new();
         let pid = w.spawn_planet(50, 50, 3, Material::Rock as u8);

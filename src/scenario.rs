@@ -153,7 +153,6 @@ pub fn default_scenario(world: &mut World) {
     let planet_id = world.bodies.last().unwrap().id;
     if let Some(body) = world.bodies.iter_mut().find(|b| b.id == planet_id) {
         body.velocity = glam::Vec2::new(0.0, 0.5);
-        body.velocity.y = 0.5;
     }
 }
 
