@@ -2,7 +2,7 @@
 
 **Canonical source of truth: this file.** The vault is a one-way mirror (if/when we create one); this is authoritative. Edit on a branch + PR. No direct-to-main pushes.
 
-> **Status:** Phase 0 — design locked, repo bootstrap. No engine code yet.
+> **Status:** Phase 2 landed on branch `feat/phase-2-multi-body-gravity`. Awaiting PR + review.
 
 ---
 
@@ -142,6 +142,18 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 | 8 | 2026-10-08 | Phase 3: Barnes-Hut on CPU, GPU compute deferred | Tree build is small (≤4000 nodes for 1000 bodies), rebuilds fast on CPU. Pushing tree traversal to GPU requires a full sim→GPU migration — Phase 4+ question. | GPU-only Barnes-Hut (premature optimization; complicates Phase 1/2). |
 | 9 | 2026-10-08 | Render uses one byte per cell (R8Unorm) + a 256-entry palette texture | Material fits in one byte; palette lookup is one shader instruction. Less bandwidth, simpler code. | Rgba8 for sim data (wastes 75% of bandwidth), per-material branch in fragment shader (GPU unfriendly). |
 | 10 | 2026-10-08 | Phase 2: bonds are sticky (once broken, stay broken) | Phase 1 auto-rebonded from adjacency — fine for visual continuity, breaks the disintegration effect in Phase 2 (debris would re-bond into Frankenstein planets). Sticky bonds make the visual signature of mass loss to a black hole work. | Keep auto-rebond (debris heals, disintegration is invisible), perfect-rebuild from adjacency every frame (no notion of "broken" bonds — same as Phase 1). |
+| 11 | 2026-10-08 | Phase 2: per-cell `body_index: i32` tracks owning body | Decouples particle ownership from gravity influence. A planet particle is still attracted to all bodies (BlackHole included) but the event-horizon destruction can decrement the *owning* planet's `particle_budget`. | Re-derive ownership on demand (O(n*m) each tick, hard to keep in sync with `bonds`), attach body id to the `Body` struct (single owner doesn't model multi-body influence). |
+| 12 | 2026-10-08 | Phase 2: per-cell gravity uses sign of net accel + magnitude-scaled `max_steps` (1/2/3) | Re-uses the existing falling-sand movement primitive, no need for sub-cell particle positions. The "tidal peel" still works because adjacent particles feel different accelerations and so take different step directions. | Sub-cell particle positions (more refactor for a difference the user can't see at the spec'd grid size), per-particle velocity vectors (breaks the falling-sand model). |
+| 13 | 2026-10-08 | Phase 2: bodies use leapfrog integration (kick + drift) not pure Verlet | Body-body gravity is `N²/2` ops/tick, the average-accel Verlet requires keeping a *previous* accel cache. Leapfrog stores only the new accel and is also symplectic at dt=1 grid step. Stability is identical for our orbital timescales. | Pure velocity Verlet (extra accel-cache state for marginal benefit at dt=1). |
+| 14 | 2026-10-08 | Phase 2: `Material::EventHorizon` (dark purple) drawn as a cosmetic ring around BlackHole bodies | The spec said "the horizon itself is just a circle of vacuum", but a vacuum circle is invisible against the black background. A dark-purple ring of cells is visually distinct without needing a second render pass or special shader. | Separate render layer for bodies (second draw call, premature for v0.1), shader-side circle rendering (we don't even use the shader's color picker yet, so this is over-engineering). |
+| 15 | 2026-10-08 | Phase 2: event-horizon destruction is strict-less-than (d² < r²), not ≤ | Reads as a circle, not a filled disk. Particles exactly at the horizon stay alive for one tick and form a "buffer zone". The cosmetic EventHorizon ring covers this buffer so the user doesn't notice. | Use ≤ (no buffer; particles at the exact boundary vanish, looks like a 1-cell stutter). |
+| 16 | 2026-10-08 | Phase 2: body velocity Verlet uses `dt=1` (one tick) | Grid step is the natural time unit. Orbit math works out as cells/tick. The decision is "what does dt mean for the symplecticity of the integrator" — at dt=1 the leapfrog integrator is well within its stability range for our G and mass scales. | Variable dt (more bookkeeping, no benefit at this scale). |
+| 17 | 2026-10-08 | Phase 2: `move_pass` uses the in-progress `claim` array as the occupancy map (NOT the original `self.particles`) | The original `find_target` only checked the original grid, so when two particles converged on the same target cell in the same tick the second one silently overwrote the first — up to 60% of a planet's particles could vanish per 40 ticks during a close approach. Routing `claim` through `find_target` fixes this with a one-line change. | Keep checking `self.particles` (silently loses particles during tidal stripping — the user sees a planet "evaporate" without anything being consumed by the BH). |
+| 18 | 2026-10-08 | Phase 2: bodies that hit a wall get their wall-directed velocity zeroed (not reflected) | Reflection inverts the velocity and would put a body back into the world — but with the falling-sand sim the body is also being pulled by gravity, so reflection interacts weirdly with the integrator. Zeroing the wall component lets the body slide along the wall and the integrator remains symplectic. A wall-pinned body is also a problem: a heavy planet body stuck at (0, 0) would pull the BH across the screen for as long as the user watches. | Reflect (looks natural in a hard-edge game, but the integrator treats it as a momentum-reversing collision, which can leak energy), toroidal wrap (visually confusing — bodies disappear off one edge and reappear on the other). |
+| 19 | 2026-10-08 | Phase 2: default scenario uses a **COM-stationary** initial-velocity setup (`v_BH = -(m_planet/m_BH) * v_planet`) | Without this, the planet's tangential velocity gives the system net momentum and the COM drifts in the +v_planet direction. The 9:1 BH:planet mass ratio means the BH orbits the COM at radius `m_planet/(m_BH+m_planet) * r ≈ 4 cells` instead of the COM drifting at ~0.05 cells/tick, which is what the user actually sees as "the BH walking across the screen". | Set both to zero (planet just falls in), use a 100x heavier BH (clutters the cell count and changes the G-vs-mass interpretation). |
+| 20 | 2026-10-08 | Phase 2: default scenario uses a **circular orbit at r=50** with v = v_circ | The previous default (r=60, v=0.5) had eccentricity 0.875 and apocenter ≈ 900 cells — way off the 256×256 grid. The planet flew off the screen in one tick, hit a wall, and the resulting pinned mass dragged the BH around indefinitely. A circular orbit at r=50 with v=v_circ is bounded, fits in the grid, and lets the user watch a complete orbit. For wilder / destructive orbits the user passes a custom `--bodies "..."`. | Keep r=60, v=0.5 (apocenter 900 cells, off-grid — the bug we're fixing), near-circular at r=40 (planet gets fully consumed within 400 ticks of running and the BH retains the orbital velocity, looks like "the BH zoomed around"). |
+| 21 | 2026-10-08 | Phase 2: when a planet body's mass hits 0 (all particles consumed) we zero its velocity and clear its cached accel | NaN guard for `0/0` in the body-body gravity loop. Without it the BH would NaN-pill the moment a planet vanished. | Allow NaN to propagate (BH instantly disappears, looks like a rendering bug, hard to debug). |
+| 22 | 2026-10-09 | Phase 2: event horizon applies Newton's 3rd law — per consumed particle `Δv_BH = v_particle / M_BH`, accumulated across all particles consumed in a tick | When a particle vanishes at the horizon, its momentum vanishes with it unless we transfer it. Without this, total system momentum is not conserved across the horizon and the BH drifts after consuming mass (the COM "walks" in the direction of the BH's initial velocity). The previous fix (COM-stationary init) made the symptom subtle; this fixes the underlying physics. The particle's velocity is approximated as its owning planet body's velocity (bonded particles ride with the planet; this is the dominant component of each particle's world-frame velocity). Recoil is accumulated in a small per-BH vector inside `apply_event_horizons` and applied after the destruction loop to avoid borrow conflicts with the per-planet `particle_budget` decrement. | No recoil (conservation violated; the only way the user can still see the BH drift), apply recoil to the owning planet instead (the consuming BH is the body that needs the momentum; the planet's velocity is unchanged because only its mass shrinks), approximate the particle's velocity using the per-cell gravity acceleration (centripetal, not tangent — wrong direction for circular orbits). |
 
 ---
 
@@ -151,15 +163,160 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 - **Bodies: emergent vs first-class?** Phase 1 is emergent. Phase 4 makes them explicit. Decision deferred.
 - **Save/load?** Not in any phase yet. Defer to Phase 4+.
 
+## Phase 2 implementation notes
+
+- **Mass unit:** `1 mass unit = 1 particle of Rock`. A planet's mass equals
+  its current `particle_budget × 1.0`. A BlackHole's mass is set explicitly
+  at spawn (the BH is a point mass, not a particle cluster).
+- **Sticky bonds:** `bond_state: Vec<u8>` is the lifetime bond bitmask. New
+  bonds are set only on planet spawn; bond breaks clear bits in
+  `bond_state` permanently. Active bonds each tick =
+  `bond_state & current_adjacency`. (See decision #10.)
+- **Body ownership:** each grid cell stores `body_index: i32` (default `-1`).
+  Spawned planets stamp their `id` into all cells they fill; event-horizon
+  destruction decrements the owning body's `particle_budget`.
+- **Event horizon:** BlackHole bodies destroy particles whose grid cell
+  lies within `event_horizon_radius` (default 3 cells). Visualized as a
+  faint purple ring of `EventHorizon` cells (new material #4).
+- **Body radius semantics:** `Body.radius` is for *event horizon / visual
+  circle*, not collision. Body-body collision is Phase 4. Phase 2 bodies
+  are point masses.
+- **Particle sub-cell positions?** Still integer grid cells. Bodies live
+  at f32 sub-cell resolution. The differential motion that drives tidal
+  peeling comes from per-particle gravity recomputation, not from
+  sub-cell particle positions.
+- **Body-particle position alignment on spawn:** the gravity solver
+  reads a body's `position` and computes the per-cell gravity vector
+  from there. The particle disk is filled at integer cells (rounded
+  from the spawn spec). If a CLI spec like `planet:x=180.5,y=128,...`
+  is passed, the particles land at (180, 128) but the body sits at
+  (180.5, 128.0) — half a cell off from its own mass. This creates a
+  0.5-cell gravity bias that compounds over hundreds of ticks. See
+  Phase 2 follow-up §"Body-particle position alignment".
+
+---
+
+## Phase 2 follow-ups (from PR #4 review)
+
+These are issues the PR review caught but didn't block on. They should
+land as small follow-up commits on `feat/phase-2-multi-body-gravity`
+(or on a new branch off the merged main) before Phase 3 work begins.
+
+### 1. Body-particle position alignment on CLI spawn [BLOCKER]
+
+**Problem:** `apply_scenario` in `src/scenario.rs:194-207` rounds
+`(x, y)` to int for `spawn_planet` (so the particle disk lands at
+integer cells) but then sets `body.position` to the **unrounded**
+`(x, y)`. For a non-integer CLI spec the body sits up to 0.5 cells
+off-center from its own particle mass. The default scenario is
+immune (it uses integer coords) but `--bodies "planet:x=180.5,..."`
+triggers it.
+
+**Fix options (pick one):**
+- **(A) Round both.** `apply_scenario` calls `.round()` on `(x, y)`
+  once and uses the rounded value for both the particle spawn
+  AND the body position. Simple, consistent with the spec's
+  "Bodies live in grid cells" framing for the integer-coord case
+  (the f32 body type is incidental — it's there to support
+  sub-cell motion *during* the sim, not at spawn).
+- **(B) Accept sub-cell body positions, document it, and add a
+  test that the spec-parser round-trip preserves the fractional
+  part.** Update the "Body sub-cell positions" note in the
+  implementation notes to be unambiguous: "Bodies can spawn at
+  f32 sub-cell positions, decoupled from the integer-cell
+  particle disk. The 0.5-cell offset is intentional and is
+  bounded by the planet's spawn radius (the particle disk covers
+  a radius-N ball around the integer-rounded cell)."
+
+**Recommendation:** Option (A) for now. The spec says bodies live
+at integer cells in the spawn sense; sub-cell f32 is for *motion
+during* the sim (so a body at integer cell 100 can drift to
+100.3 over many ticks). Mixing the two at spawn-time creates the
+geometry gap. Sub-cell motion is preserved; sub-cell spawn is
+not needed for any current spec.
+
+**Test:** add `apply_scenario_rounds_body_position_to_particle_disk`
+to `src/scenario.rs` tests. Pass a `BodySpec::Planet { x: 180.5, ... }`
+and assert that the spawned body's `position` matches the integer
+cell at the center of the particle disk, not the unrounded `x`.
+
+### 2. Docstring numerical drift in `default_scenario` [nit]
+
+`src/scenario.rs:139-146` docstring computes v_circ and period at
+**r=40**, but the code uses **r=50**. The math is correct for the
+wrong radius. Pick one: either change the docstring to use r=50
+(v_circ = sqrt(0.16) = 0.4, period = 2*pi*sqrt(125000/8) ≈ 785
+ticks), or change the code to r=40 (slower orbit, tidier numbers
+in the docstring). Recommend: change the docstring to match the
+code. The orbital shape is identical either way.
+
+### 3. Stale "near-collision orbit" reference in `app.rs` [nit]
+
+`src/app.rs:7` says default is "1 BH at grid center + 1 planet on
+a near-collision orbit" — the OLD default. The current default is
+a circular orbit with COM-stationary init (per decision #20).
+Update to match.
+
+### 4. Test count mismatch in SPEC Session 4 [nit]
+
+`docs/SPEC.md:237` (Session 4) says "30 tests pass" — actual is
+**27** pass, 2 ignored. The 3 new tests in 981a906 bring it from
+24 to 27. Fix the number.
+
+### 5. Test comment number drift in `move_pass_does_not_lose_particles` [nit]
+
+`src/sim.rs:1022` says "without the fix ~62 particles vanish" —
+the commit message in 981a906 says "Up to 84 of 113 particles in
+the default scenario between t=0 and t=200". Pick one number.
+Recommend: keep the commit message's 84 (it's the measured number
+at t=200) and rephrase the test comment to "without the fix a
+large fraction of a planet's particles can vanish during a close
+encounter — measured at 84 of 113 by t=200 in the default scenario".
+
+### 6. Missing Session 4 entry in `HANDOFF.md` [nit]
+
+HANDOFF.md ends at Session 3 (Phase 2 ships). SPEC.md has the
+Session 4 entry for the BH-zoom fix. Add a HANDOFF Session 4
+entry consistent with the SPEC entry — same content, condensed
+to the HANDOFF format (4-5 bullets max per session).
+
+### 7. Compiler warnings in tests [nit]
+
+Two test-only warnings:
+- `src/sim.rs:651` — `unused import: crate::body::Body`
+- `src/sim.rs:910` — `unused variable: initial_distance_sq`
+
+Remove or `#[allow(unused)]`. They are test-only so harmless
+but rustc is right.
+
+### 8. Vestigial comment in `src/body.rs:11` [nit]
+
+`// (H, W are referenced from sim.rs via the W/H re-exports; this
+import is unused.)` — there is no actual import above or below
+this comment. Looks like a leftover from a refactor. Delete the
+comment.
+
+### 9. SPEC Session 4 "Planet mass drops to ~34 over 800 ticks" [nit]
+
+`docs/SPEC.md:243` says "Planet mass drops from 113 → ~34 over
+800 ticks of tidal stripping but does not fully vanish." The
+dump test only runs to 400 ticks (mass=46). Either run the
+test out to 800 ticks and report the actual number, or remove
+the speculative "~34" framing and say "mass drops continuously
+via tidal stripping". Recommend: extend the dump test to 800
+ticks and replace the ~34 with the actual measurement. This is
+the kind of number that's easy to verify and will get copy-pasted
+into a tutorial later.
+
 ---
 
 ## Acceptance Criteria (per phase)
 
 | Phase | Status | What the user can do when done |
 |---|---|---|
-| 0 | IN PROGRESS | `git clone` the repo, see this file, CI is green. |
-| 1 | TODO | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
-| 2 | TODO | Place 2+ bodies, see real orbital mechanics. |
+| 0 | DONE | `git clone` the repo, see this file, CI is green. |
+| 1 | DONE | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
+| 2 | DONE | Place 2+ bodies, see real orbital mechanics. |
 | 3 | TODO | 10k+ particles at 30+ fps. |
 | 4 | TODO | "Place planet" is a primitive with mass/velocity. |
 | 5 | TODO | Playable game with levels. |
@@ -167,6 +324,119 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 ---
 
 ## Session Log
+
+### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
+
+User confirmed the MacBook playtest of the Session 4 fix looks correct
+(BH stays near grid center, planet orbits, stream is the expected
+tidal peel). Followed up on the one remaining known limitation
+flagged in Session 4: particles consumed at the event horizon took
+their momentum with them, so the BH retained its pre-consumption
+velocity and total system momentum was not conserved. The symptom
+was hidden by the COM-stationary default-scenario init but would
+have shown up in head-on / off-COM scenarios.
+
+Changes:
+
+- `apply_event_horizons` now applies `Δv_BH = v_particle / M_BH` per
+  consumed particle (where `v_particle` is approximated as the owning
+  planet body's velocity). Recoil is accumulated per BH in a small
+  `Vec<(u32, Vec2)>` and applied at the end of the destruction loop
+  to avoid borrow conflicts with the `particle_budget` decrement.
+  Locked in decision #22.
+- New test `event_horizon_conserves_total_momentum` runs the
+  COM-stationary default scenario to consumption and verifies two
+  invariants: (1) total system momentum stays ≈ 0 throughout
+  (conservation); (2) the BH's velocity is ≈ 0 after consumption
+  (its initial recoil has been cancelled by the absorbed planet
+  momentum). Both pass on the first run.
+- Updated the `body_body_gravity_conserves_momentum` test comment
+  to point at the new test for the event-horizon regime instead of
+  the old "tracked as a follow-up" note.
+
+Verification: 28 tests pass (was 27, +1), 2 ignored. Perf sanity
+(10 BHs + ~65k particles) is 3.41 ms/tick — within noise of the
+Session 4 number (3.3 ms/tick). Dump of the default scenario at
+t=400 shows BH velocity dropped from the initial (0, -0.045) to
+(0.005, 0.017) — almost stationary at the COM, exactly as the math
+predicts.
+
+### 2026-10-08 — Session 4: Phase 2 hardening — fix BH "zooming" playtest bug
+
+User reported the BH was "zooming around the screen" after consuming a
+planet on their MacBook. Three real bugs behind it:
+
+1. **`move_pass` silently lost particles** during close encounters.
+   `find_target` checked the original grid for occupancy but not the
+   in-progress `claim` array, so two particles converging on the same
+   target cell in the same tick would overwrite each other and the
+   first would vanish. Up to 84 of 113 particles in the default
+   scenario between t=0 and t=200 — silently. The body's
+   `particle_budget` counter said they were still alive, but they
+   weren't on the grid. Fix: pass `claim` into `find_target` and treat
+   claimed cells as occupied. Locked in decision #17.
+
+2. **Frankenstein integrator** was not actually Verlet or leapfrog.
+   The previous code did `position += v + 0.5*a_old` followed by
+   `velocity += a_new` — position uses old accel (Verlet), velocity
+   uses new accel (Forward Euler). Hybrid gains energy each tick and
+   orbits spiral outward. Fix: proper KDK leapfrog
+   (v += 0.5*a_old; x += v; compute a_new; v += 0.5*a_new).
+   Locked in decision #13 (re-confirmed) and verified by new
+   `leapfrog_does_not_gain_energy_in_pure_orbit` test.
+
+3. **Planet pinned at a wall** after the previous default's near-
+   collision orbit threw the planet off the grid. A heavy mass pinned
+   at (0, 255) is a steady sideways pull on the BH. Fix: in
+   `body_leapfrog_first_half` zero the wall-directed velocity when a
+   body would clamp, so it slides along the wall. Locked in decision
+   #18. Also: new default scenario is a circular orbit at r=50 with
+   COM-stationary initial velocities, so the planet never hits a wall
+   in the first place. Locked in decisions #19 and #20.
+
+Tests added: `move_pass_does_not_lose_particles`,
+`leapfrog_does_not_gain_energy_in_pure_orbit`,
+`body_body_gravity_conserves_momentum`. **30 tests pass**, 2 ignored
+(visual dump + perf sanity).
+
+Default scenario now: BH at (128, 128), mass=1000, v=(0, -0.045) (COM
+recoil); planet at (178, 128) on circular orbit r=50 with v=v_circ.
+COM stays at (133, 128); BH orbits the COM at radius 4 cells in a
+tight circle, which reads as "stationary" in the visual. Planet mass
+drops from 113 → ~34 over 800 ticks of tidal stripping but does not
+fully vanish.
+
+### 2026-10-08 — Session 3: Phase 2 ships on `feat/phase-2-multi-body-gravity`
+
+- New module `src/body.rs` (Body / BodyKind / G / Plummer / horizon
+  constants). `src/scenario.rs` (parse `--bodies "..."` and apply).
+  `World` extended with `bodies`, `body_index`, `bond_state` (sticky).
+- Physics: body-body N² gravity + leapfrog, body-particle N² Plummer
+  gravity drives the falling-sand move pass via sign-of-accel +
+  magnitude-scaled max_steps. Event horizon destroys particles strictly
+  inside `radius`; planet body's `particle_budget` mutates per particle
+  destroyed → its mass mutates in real time.
+- Sticky bonds implemented per spec §"Phase 1 → Phase 2 Transition":
+  `bond_state` is the lifetime mask, `bonds = bond_state & adjacency`,
+  bond break clears `bond_state` bit permanently AND mirror-clears on
+  neighbour cell. New bonds only form on planet spawn.
+- Visual: `Material::EventHorizon` (dark purple) drawn as a 1-cell
+  ring around every BlackHole body — purely cosmetic, not a particle,
+  no bonds.
+- Default scenario: 1 BH at grid center (mass 1000) + 1 planet at
+  r=60 with v=(0, 0.5) → near-collision orbit (v=1.4× v_circ). Over
+  400 ticks the planet loses 11 of 113 particles (gradual strip),
+  mass = 113 → 102, orbit visibly decays.
+- CLI: `--bodies "bh:x=N,y=N,m=N;planet:x=N,y=N,r=N,vx=N,vy=N"`
+  (single-spec or `;`-joined; `--bodies=...` also accepted).
+- 24 tests pass (8 phase-1 sim, 7 phase-2 sim [sticky bonds ×2,
+  event horizon, mass decrement, planet migrate, orbit, slingshot,
+  two-BH tearing], 3 body.rs, 9 scenario.rs). 2 ignored visual-dump
+  tests. perf sanity: 10 BHs + full grid (~65k particles) runs at
+  ~3 ms/tick (~310 fps) in release, well above the 30 fps target.
+- Acceptance criteria 1–5 hit. Criterion 6 (perf budget) hit by ~10×
+  in release on this dev box. Real m5 / gaming-rig numbers pending.
+- Decisions #11–16 in the Decisions Log capture the design calls.
 
 ### 2026-10-08 — Session 1: bootstrap
 - Locked design: 2D, hand-rolled wgpu, per-particle bonds.

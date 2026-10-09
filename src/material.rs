@@ -10,6 +10,10 @@ pub enum Material {
     Rock = 1,
     Ice = 2,
     Plasma = 3,
+    /// Faint purple ring drawn around BlackHole bodies to make the
+    /// event horizon visible. Particles can never persist here (the
+    /// sim destroys them) so this is purely a visual hint.
+    EventHorizon = 4,
 }
 
 impl Material {
@@ -18,6 +22,7 @@ impl Material {
             1 => Self::Rock,
             2 => Self::Ice,
             3 => Self::Plasma,
+            4 => Self::EventHorizon,
             _ => Self::Vacuum,
         }
     }
@@ -29,6 +34,7 @@ impl Material {
             Self::Rock => [150, 140, 130, 255],
             Self::Ice => [180, 220, 240, 255],
             Self::Plasma => [255, 130, 50, 255],
+            Self::EventHorizon => [80, 30, 100, 255],
         }
     }
 
