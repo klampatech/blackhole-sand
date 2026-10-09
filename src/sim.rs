@@ -319,37 +319,77 @@ impl World {
     }
     /// For every BlackHole body, destroy every particle whose grid cell
     /// lies within `EVENT_HORIZON_RADIUS`. Decrement the owning planet
-    /// body's `particle_budget` for each particle destroyed.
+    /// body's `particle_budget` for each particle destroyed, and apply
+    /// an equal-and-opposite recoil to the consuming BH so that the
+    /// total system momentum is conserved across the horizon.
     fn apply_event_horizons(&mut self) {
-        // Snapshot the BlackHole positions to avoid borrow conflicts.
-        let horizons: Vec<(i32, i32, f32)> = self
+        // Snapshot BlackHole (id, cell_x, cell_y, radius, mass). We need
+        // the mass to convert the consumed particle's momentum into a
+        // velocity change (Newton's 3rd law) and the id so we can apply
+        // the recoil to the correct body when several BHs are present.
+        let horizons: Vec<(u32, i32, i32, f32, f32)> = self
             .bodies
             .iter()
             .filter(|b| b.destroys_particles())
             .map(|b| {
                 let (cx, cy) = b.cell_position();
-                (cx, cy, b.radius)
+                (b.id, cx, cy, b.radius, b.mass)
             })
             .collect();
         if horizons.is_empty() {
             return;
         }
+        // Accumulate per-BH recoil so we can apply it after the loop.
+        // We need owned storage here (not a borrow of self.bodies) so
+        // the destruction loop can still mutate self.bodies to update
+        // each owning planet's particle_budget without a borrow conflict.
+        let mut recoil_by_bh: Vec<(u32, glam::Vec2)> = horizons
+            .iter()
+            .map(|(id, _, _, _, _)| (*id, glam::Vec2::ZERO))
+            .collect();
         for y in 0..H {
             for x in 0..W {
                 let i = Self::idx(x, y);
                 if self.particles[i] == 0 {
                     continue;
                 }
-                for &(hx, hy, hr) in &horizons {
+                for &(bh_id, hx, hy, hr, m_bh) in &horizons {
                     let hr_sq = hr * hr;
                     let dx = (x as i32 - hx) as f32;
                     let dy = (y as i32 - hy) as f32;
                     let d2 = dx * dx + dy * dy;
                     if d2 < hr_sq {
-                        // Destroy the particle.
+                        // Destroy the particle. If it is owned by a
+                        // planet body, transfer its momentum to the
+                        // consuming BH (Newton's 3rd law) and
+                        // decrement the owning planet's particle_budget.
                         let owner = self.body_index[i];
                         if owner >= 0 {
-                            // Decrement the owning planet's particle_budget.
+                            // Approximate the particle's velocity as
+                            // its owning planet's velocity. Bonded
+                            // particles ride with the planet, so this
+                            // is the dominant component of each
+                            // particle's world-frame velocity. Mass
+                            // unit is 1 Rock particle, so per particle
+                            // the BH velocity change is
+                            //     Δv_BH = v_particle / M_BH.
+                            if let Some(p) =
+                                self.bodies.iter().find(|b| b.id == owner as u32)
+                            {
+                                if m_bh > 0.0 {
+                                    let dv = p.velocity / m_bh;
+                                    if let Some(slot) = recoil_by_bh
+                                        .iter_mut()
+                                        .find(|(id, _)| *id == bh_id)
+                                    {
+                                        slot.1 += dv;
+                                    }
+                                }
+                            }
+                            // Now mutate the owning planet's
+                            // particle_budget. (Borrow ends with the
+                            // if-let block so the iter_mut() above
+                            // is unambiguous.)
                             if let Some(b) =
                                 self.bodies.iter_mut().find(|b| b.id == owner as u32)
                             {
@@ -364,6 +404,17 @@ impl World {
                         self.bond_state[i] = 0;
                         break;
                     }
+                }
+            }
+        }
+        // Apply the accumulated recoil to each consuming BH. Doing it
+        // here (after the destruction loop) means we never hold a
+        // mutable borrow on self.bodies while also reading it inside
+        // the loop.
+        for (bh_id, dv) in recoil_by_bh {
+            if dv != glam::Vec2::ZERO {
+                if let Some(bh) = self.bodies.iter_mut().find(|b| b.id == bh_id) {
+                    bh.velocity += dv;
                 }
             }
         }
@@ -1052,11 +1103,12 @@ mod tests {
         // f32 epsilon (per-pair Newton's 3rd law in body_body_gravity).
         //
         // NB: when particles ARE destroyed at an event horizon the
-        // total system momentum drifts because the vanishing
-        // particles take their momentum with them without
-        // transferring it to the BH. That is a separate, real
-        // physics concern tracked as a follow-up; this test stays
-        // inside the regime where Newton's 3rd law is exact.
+        // BH now absorbs the consumed particle's momentum
+        // (apply_event_horizons applies Δv_BH = v_particle / M_BH per
+        // particle). See `event_horizon_conserves_total_momentum`
+        // for the regime where consumption is involved. This test
+        // stays inside the body-body-only regime so we don't have
+        // to reason about bond evolution under tidal stress here.
         let mut w = World::new();
         w.spawn_black_hole(80.0, 128.0, 1000.0);
         w.spawn_black_hole(176.0, 128.0, 1000.0);
@@ -1075,6 +1127,85 @@ mod tests {
         assert!(
             p1 < 1.0,
             "momentum drift too large: |p| = {p1:.3} (initial |p_per_body| = {initial_p_per_body})"
+        );
+    }
+
+    #[test]
+    fn event_horizon_conserves_total_momentum() {
+        // COM-stationary BH + planet at r=50 (the default scenario
+        // setup). Initial total momentum is 0 by construction: the
+        // BH's small -y recoil exactly balances the planet's +y
+        // orbital momentum. As the planet's particles are consumed
+        // at the BH's event horizon, apply_event_horizons now
+        // transfers each consumed particle's momentum (≈ planet
+        // body velocity) to the BH. Two invariants must hold:
+        //
+        //   1. The total system momentum stays ≈ 0 for the whole
+        //      run (Newton's 3rd law across the horizon).
+        //
+        //   2. Once the planet is mostly consumed, the BH's
+        //      velocity is ≈ 0 — its initial recoil has been
+        //      cancelled by the absorbed planet momentum. (Without
+        //      the recoil the BH would retain its initial v and
+        //      visibly drift across the screen.)
+        let mut w = World::new();
+        let bh_id = w.spawn_black_hole(128.0, 128.0, 1000.0);
+        let pid = w.spawn_planet(178, 128, 6, Material::Rock as u8);
+
+        let m_planet = w.bodies.iter().find(|b| b.id == pid).unwrap().mass;
+        let v_circ = (G * 1000.0 / 50.0_f32).sqrt();
+        w.bodies
+            .iter_mut()
+            .find(|b| b.id == pid)
+            .unwrap()
+            .velocity = glam::Vec2::new(0.0, v_circ);
+        w.bodies
+            .iter_mut()
+            .find(|b| b.id == bh_id)
+            .unwrap()
+            .velocity = glam::Vec2::new(0.0, -m_planet / 1000.0 * v_circ);
+
+        // Initial total momentum should be ~0.
+        let initial_p: glam::Vec2 = w.bodies.iter().map(|b| b.mass * b.velocity).sum();
+        assert!(
+            initial_p.length() < 1e-3,
+            "expected zero initial total p, got {initial_p:?}"
+        );
+
+        // Run until the planet is mostly consumed (or 8000 ticks).
+        let mut ticks = 0;
+        loop {
+            w.step();
+            ticks += 1;
+            let planet_mass = w
+                .bodies
+                .iter()
+                .find(|b| b.id == pid)
+                .map(|b| b.mass)
+                .unwrap_or(0.0);
+            if planet_mass < 5.0 || ticks >= 8000 {
+                break;
+            }
+        }
+
+        // Invariant 1: total momentum is conserved.
+        let final_p: glam::Vec2 = w.bodies.iter().map(|b| b.mass * b.velocity).sum();
+        let drift = final_p.length();
+        assert!(
+            drift < 5.0,
+            "system momentum not conserved after {ticks} ticks: \
+             |Δp| = {drift:.3} (initial 0, final p = {final_p:?})"
+        );
+
+        // Invariant 2: BH velocity is approximately 0 after the
+        // planet's momentum has been absorbed.
+        let bh = w.bodies.iter().find(|b| b.id == bh_id).unwrap();
+        assert!(
+            bh.velocity.length() < 0.1,
+            "BH velocity after planet consumption: {:?} \
+             (expected ≈ 0; with recoil the absorbed planet \
+             momentum cancels the initial recoil)",
+            bh.velocity
         );
     }
 

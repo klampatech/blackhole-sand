@@ -153,6 +153,7 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 | 19 | 2026-10-08 | Phase 2: default scenario uses a **COM-stationary** initial-velocity setup (`v_BH = -(m_planet/m_BH) * v_planet`) | Without this, the planet's tangential velocity gives the system net momentum and the COM drifts in the +v_planet direction. The 9:1 BH:planet mass ratio means the BH orbits the COM at radius `m_planet/(m_BH+m_planet) * r ≈ 4 cells` instead of the COM drifting at ~0.05 cells/tick, which is what the user actually sees as "the BH walking across the screen". | Set both to zero (planet just falls in), use a 100x heavier BH (clutters the cell count and changes the G-vs-mass interpretation). |
 | 20 | 2026-10-08 | Phase 2: default scenario uses a **circular orbit at r=50** with v = v_circ | The previous default (r=60, v=0.5) had eccentricity 0.875 and apocenter ≈ 900 cells — way off the 256×256 grid. The planet flew off the screen in one tick, hit a wall, and the resulting pinned mass dragged the BH around indefinitely. A circular orbit at r=50 with v=v_circ is bounded, fits in the grid, and lets the user watch a complete orbit. For wilder / destructive orbits the user passes a custom `--bodies "..."`. | Keep r=60, v=0.5 (apocenter 900 cells, off-grid — the bug we're fixing), near-circular at r=40 (planet gets fully consumed within 400 ticks of running and the BH retains the orbital velocity, looks like "the BH zoomed around"). |
 | 21 | 2026-10-08 | Phase 2: when a planet body's mass hits 0 (all particles consumed) we zero its velocity and clear its cached accel | NaN guard for `0/0` in the body-body gravity loop. Without it the BH would NaN-pill the moment a planet vanished. | Allow NaN to propagate (BH instantly disappears, looks like a rendering bug, hard to debug). |
+| 22 | 2026-10-09 | Phase 2: event horizon applies Newton's 3rd law — per consumed particle `Δv_BH = v_particle / M_BH`, accumulated across all particles consumed in a tick | When a particle vanishes at the horizon, its momentum vanishes with it unless we transfer it. Without this, total system momentum is not conserved across the horizon and the BH drifts after consuming mass (the COM "walks" in the direction of the BH's initial velocity). The previous fix (COM-stationary init) made the symptom subtle; this fixes the underlying physics. The particle's velocity is approximated as its owning planet body's velocity (bonded particles ride with the planet; this is the dominant component of each particle's world-frame velocity). Recoil is accumulated in a small per-BH vector inside `apply_event_horizons` and applied after the destruction loop to avoid borrow conflicts with the per-planet `particle_budget` decrement. | No recoil (conservation violated; the only way the user can still see the BH drift), apply recoil to the owning planet instead (the consuming BH is the body that needs the momentum; the planet's velocity is unchanged because only its mass shrinks), approximate the particle's velocity using the per-cell gravity acceleration (centripetal, not tangent — wrong direction for circular orbits). |
 
 ---
 
@@ -323,6 +324,42 @@ into a tutorial later.
 ---
 
 ## Session Log
+
+### 2026-10-09 — Session 5: Phase 2 — Newton's 3rd law across the event horizon
+
+User confirmed the MacBook playtest of the Session 4 fix looks correct
+(BH stays near grid center, planet orbits, stream is the expected
+tidal peel). Followed up on the one remaining known limitation
+flagged in Session 4: particles consumed at the event horizon took
+their momentum with them, so the BH retained its pre-consumption
+velocity and total system momentum was not conserved. The symptom
+was hidden by the COM-stationary default-scenario init but would
+have shown up in head-on / off-COM scenarios.
+
+Changes:
+
+- `apply_event_horizons` now applies `Δv_BH = v_particle / M_BH` per
+  consumed particle (where `v_particle` is approximated as the owning
+  planet body's velocity). Recoil is accumulated per BH in a small
+  `Vec<(u32, Vec2)>` and applied at the end of the destruction loop
+  to avoid borrow conflicts with the `particle_budget` decrement.
+  Locked in decision #22.
+- New test `event_horizon_conserves_total_momentum` runs the
+  COM-stationary default scenario to consumption and verifies two
+  invariants: (1) total system momentum stays ≈ 0 throughout
+  (conservation); (2) the BH's velocity is ≈ 0 after consumption
+  (its initial recoil has been cancelled by the absorbed planet
+  momentum). Both pass on the first run.
+- Updated the `body_body_gravity_conserves_momentum` test comment
+  to point at the new test for the event-horizon regime instead of
+  the old "tracked as a follow-up" note.
+
+Verification: 28 tests pass (was 27, +1), 2 ignored. Perf sanity
+(10 BHs + ~65k particles) is 3.41 ms/tick — within noise of the
+Session 4 number (3.3 ms/tick). Dump of the default scenario at
+t=400 shows BH velocity dropped from the initial (0, -0.045) to
+(0.005, 0.017) — almost stationary at the COM, exactly as the math
+predicts.
 
 ### 2026-10-08 — Session 4: Phase 2 hardening — fix BH "zooming" playtest bug
 
