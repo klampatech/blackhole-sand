@@ -20,6 +20,30 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 ## Log
 
 
+### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
+
+- New module `src/barnes_hut.rs` (flat `Vec<QuadNode>` quadtree,
+  `QuadTree::new(bodies, theta)` build, `compute_accel(p)` walk
+  with s/d<theta criterion). Integrated into `move_pass` via a
+  new `gravity_step_for_cell_bh`; the path activates when
+  `bodies.len() >= 8`. Body-body gravity stays N² pairwise.
+- Decisions #23–#27 added (theta=0.5 default, threshold=8, rebuild
+  every tick, body-body N² stays, Plummer softening in tree).
+- 36 tests pass (was 29, +7 — 5 in barnes_hut, 2 in sim);
+  3 ignored. Perf: 10 BHs + 65k particles at 7.4 ms/tick; 100
+  BHs + 63k particles at 15.2 ms/tick — both well under the
+  33 ms/tick budget for 30+ fps.
+- **Playtest status:** default-scenario dump (the visual smoke
+  test) is byte-for-byte identical to the Phase 2 baseline
+  (the default scenario has 2 bodies, so Barnes-Hut is not
+  exercised). Barnes-Hut-vs-N² equivalence verified at 5%
+  relative error for 8 bodies; the 8+ body regime is the
+  Phase 3 trigger from the spec.
+- **Next up:** open PR for review; visual playtest on real
+  hardware to confirm the multi-body "tidal peel" reads
+  correctly; Phase 4 (bodies as first-class objects with
+  shape templates) is now the next major chunk of work.
+
 ### 2026-10-08 — Session 4: Phase 2 hardening (BH-zoom playtest fix)
 
 - Three real bugs were behind the MacBook "BH zooms around" report

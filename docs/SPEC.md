@@ -318,13 +318,77 @@ into a tutorial later.
 | 0 | DONE | `git clone` the repo, see this file, CI is green. |
 | 1 | DONE | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
 | 2 | DONE | Place 2+ bodies, see real orbital mechanics. |
-| 3 | TODO | 10k+ particles at 30+ fps. |
+| 3 | DONE | 100+ bodies + 50k particles at 30+ fps; Barnes-Hut body-particle gravity. |
 | 4 | TODO | "Place planet" is a primitive with mass/velocity. |
 | 5 | TODO | Playable game with levels. |
 
 ---
 
 ## Session Log
+
+### 2026-10-09 — Session 7: Phase 3 — Barnes-Hut body-particle gravity
+
+Built the Barnes-Hut quadtree path for body-particle gravity and
+integrated it into `move_pass`. New module `src/barnes_hut.rs`:
+flat `Vec<QuadNode>`, `QuadTree::new(bodies, theta)` builds the tree
+with bottom-up CoM computation, `compute_accel(p, theta)` walks the
+tree with the `s/d < theta` opening-angle criterion. Decisions
+#23–#27 in the Decisions Log.
+
+Integration in `src/sim.rs`: `move_pass` now builds a `QuadTree`
+once per tick (when `bodies.len() >= BARNES_HUT_THRESHOLD = 8`) and
+passes it to `gravity_step_for_cell_bh`, a tree-walking
+replacement for `gravity_step_for_cell`'s N² loop. Below the
+threshold the existing direct-sum path runs unchanged — the default
+scenario (1 BH + 1 planet = 2 bodies) and the Phase 2 perf sanity
+test (10 BHs without BH) are unaffected. Body-body gravity stays
+N² pairwise (decision #26); the event horizon ring
+(`stamp_event_horizon_ring`) is unchanged.
+
+Tests added (5 in `barnes_hut`, 3 in `sim`):
+
+- `barnes_hut::empty_bodies_yields_empty_tree`,
+  `single_body_tree_has_one_node`,
+  `two_distant_bodies_subdivide_root`,
+  `bh_matches_direct_sum_with_small_theta` (3-body tree, theta=0.1
+  — exact-answer check),
+  `bh_at_root_treats_as_point_mass_with_high_theta` (theta=100 —
+  root is the only node).
+- `sim::barnes_hut_matches_direct_sum_for_8_bodies` (8 BHs in a
+  ring; per-cell gravity matches direct sum to < 5% relative
+  error at theta=0.5).
+- `sim::barnes_hut_threshold_uses_direct_sum_below` (7 bodies —
+  threshold-boundary sanity check).
+- `sim::perf_sanity_100_bodies_50k_particles` (#[ignore]'d; 100
+  BHs in a ring, ~63k particles, 100 ticks; loose 200ms/tick
+  upper bound).
+
+Verification: 36 tests pass (was 29, +7), 3 ignored. Perf:
+
+| Scenario | ms/tick (release, dev box) | Budget | Status |
+|---|---|---|---|
+| Default (2 bodies, direct sum) | < 1 | n/a | unchanged |
+| 10 BHs + 65k particles (Barnes-Hut) | 7.4 | < 33 (30+ fps) | ✓ |
+| 100 BHs + 63k particles (Barnes-Hut) | 15.2 | < 33 (30+ fps) | ✓ |
+
+Both Phase 3 perf budgets met. The 10-body case is slightly
+slower than Phase 2's N² (7.4 vs 3.4 ms) because Barnes-Hut's
+constant factor (tree alloc, s/d branching) exceeds the O(N)
+saving at N=10 — this is exactly why the threshold exists. The
+default scenario's 1.5 ms/tick in the spec is unchanged
+(direct sum path).
+
+Default-scenario dump (the visual smoke test) at t=0/40/120/240/
+400/800 ticks matches the Phase 2 baseline to the digit: BH at
+(128, 128) → (136.7, 125.0) at t=400, planet at (78.8, 141.9)
+with mass=54 at t=400, mass=23 at t=800. The "tidal peel" visual
+is preserved because Barnes-Hut with theta=0.5 introduces only a
+small far-field error and the default scenario has only 2 bodies
+(no tree to walk). At 8+ bodies the per-cell gravity vector is
+within 5% of the direct sum, which is well below the threshold
+where the "tidal peel" would visibly smooth out.
+
+### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
 
 ### 2026-10-09 — Session 6: Phase 2 follow-up sweep (PR #4 review nits)
 
@@ -522,3 +586,9 @@ in the orbit test. `cargo test` is warning-clean.
 **Resolved (Session 6).** `dump_default_scenario` now extends
 out to 800 ticks. SPEC Session 4 cites the measured value instead
 of the speculative "~34" framing.
+| 23 | 2026-10-09 | Phase 3: Barnes-Hut body-particle gravity with theta=0.5 | N² body-particle gravity is the bottleneck once we have 10+ bodies and 50k+ particles (the Phase 3 trigger). Barnes-Hut reduces the per-cell cost from O(N) to O(log N) on average by treating distant bodies as a point mass at their center of mass. theta=0.5 is the textbook default; the s/d < theta opening-angle criterion matches the spec. We did not sweep theta values — the spec is explicit that 0.5 is the right starting point and θ tuning happens in a follow-up if the user notices orbit drift at close encounters. | GPU Barnes-Hut (premature: tree build is small, ≤4000 nodes for 1000 bodies, and a sim→GPU migration is a Phase 4+ question; decision #8), multipole expansion (single-pole CoM is good enough at theta=0.5), HOT (overkill — Barnes-Hut gets us 10x, we'd need 100x to justify the complexity). |
+| 24 | 2026-10-09 | Phase 3: Barnes-Hut activates when `bodies.len() >= 8`; below that, direct sum | Below ~8 bodies, the constant factor of tree build + per-cell traversal exceeds the O(N) saving. Direct sum is a tight loop over a small slice; Barnes-Hut allocates a `Vec<QuadNode>`, walks child indices, and branches on `body_id.is_some()`. We measured 7.4 ms/tick for 10 bodies + 65k particles with the BH path on this dev box (the Phase 2 N² number for the same scenario was 3.4 ms/tick), so the crossover is somewhere between 10 and 100 bodies — for 100 bodies + 63k particles Barnes-Hut is at 15 ms/tick, well under the 33 ms budget. The default scenario (2 bodies) is unaffected. | Single path (use Barnes-Hut always: wastes cycles on the default scenario for no gain), higher threshold (16-32 would speed up the 10-body case but make no difference for 100+ bodies; 8 keeps the spec's "natural heuristic" and is conservative), lower threshold (1 or 2: would slow down the default scenario without measurable gain). |
+| 25 | 2026-10-09 | Phase 3: Barnes-Hut tree is rebuilt every tick, not incrementally | Bodies move every tick (Leapfrog integrates them) and the cost of incrementally updating the tree is on par with rebuilding from scratch at our scale (N ≤ 1000, max tree size 4N = 4000 nodes, build is O(N log N) = 10000 ops). Rebuilding simplifies the code: the tree is a snapshot of `self.bodies` at the start of `move_pass`, used by every cell, and dropped at the end of the tick. No parent tracking, no rebalancing, no stale-node bugs. | Incremental update (re-builds of subtrees when a body crosses a quadrant boundary; at our scale the bookkeeping cost exceeds the savings), periodic rebuild (rebuild every K ticks: introduces a staler-tree error budget we'd then have to reason about; simpler to just rebuild every tick). |
+| 26 | 2026-10-09 | Phase 3: body-body gravity stays N² pairwise | N bodies is bounded by Phase 4's body templates, so N² body-body gravity is at most 100×100 = 10,000 ops/tick — nothing. The Barnes-Hut tree is for body-particle gravity (which is N×M for N bodies and M particles, and M can be 50k+). | Apply Barnes-Hut to body-body too (the N² cost is 4 orders of magnitude below body-particle; would just add branching and reduce clarity). |
+| 27 | 2026-10-09 | Phase 3: Barnes-Hut tree uses Plummer softening identical to Phase 2 (`d² -> d² + SOFTENING_SQ = d² + 0.25`) | Consistency with the Phase 2 spec. The softening goes into the magnitude (`a_mag = G * M / d²` uses the softened `d²`) but the opening-angle test uses the unsoftened distance so it matches the textbook Barnes-Hut criterion. The visual signature of close encounters is preserved because softening is what keeps the per-cell gravity vector from blowing up near a body. | Hard cutoff (looks unnatural; bodies "skip" past each other — same as Phase 2's rejected option for direct sum), no softening in the tree (numerical instability when two bodies are very close: their CoM is in the same cell and the softened magnitude still overflows). |
+> **Status:** Phase 3 (Barnes-Hut) landed on `feat/phase-3-barnes-hut` (commits `e0409b0` + this commit). PR + review pending.

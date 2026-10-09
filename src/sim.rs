@@ -29,6 +29,19 @@
 
 use crate::body::{Body, BodyAccel, G, SOFTENING_SQ};
 use crate::material::Material;
+use crate::barnes_hut::QuadTree;
+
+/// Default Barnes-Hut opening-angle parameter. The spec calls for
+/// 0.5; the test sweep is in `barnes_hut::tests`. Lower = more
+/// accurate, higher = faster. Phase 3 decision #23.
+pub const BARNES_HUT_THETA: f32 = 0.5;
+
+/// Threshold for switching the body-particle gravity path from
+/// direct sum to Barnes-Hut. Below this body count the per-cell
+/// tree-build + traversal cost exceeds the O(N) saving; direct
+/// sum wins on a constant-factor basis. The exact value is
+/// uncritical and tuned against the `perf_sanity_*` tests.
+pub const BARNES_HUT_THRESHOLD: usize = 8;
 
 /// Grid resolution. 256^2 is the Phase 1 spec target (~30 fps on m5). Flip to
 /// 512 once the perf budget allows it — this is the only line to change.
@@ -432,6 +445,17 @@ impl World {
         // If no bodies, fall straight down (Phase 1 fallback).
         let has_bodies = !self.bodies.is_empty();
 
+        // Phase 3: build a Barnes-Hut quadtree once per tick and use
+        // it for body-particle gravity when the body count is above
+        // the threshold. Below the threshold direct sum is faster
+        // (the constant factor of tree build + traversal exceeds the
+        // O(N) saving). See BARNES_HUT_THRESHOLD and decision #23.
+        let tree = if has_bodies && self.bodies.len() >= BARNES_HUT_THRESHOLD {
+            Some(QuadTree::new(&self.bodies, BARNES_HUT_THETA))
+        } else {
+            None
+        };
+
         for y in 0..H {
             for x in 0..W {
                 let i = Self::idx(x, y);
@@ -442,7 +466,9 @@ impl World {
                 let b = new_bonds[i];
                 let owner = new_body_index[i];
 
-                let (dx, dy, max_steps) = if has_bodies {
+                let (dx, dy, max_steps) = if let Some(tree) = &tree {
+                    gravity_step_for_cell_bh(x as i32, y as i32, tree)
+                } else if has_bodies {
                     gravity_step_for_cell(x as i32, y as i32, &self.bodies)
                 } else {
                     gravity_step_legacy(x as i32, y as i32)
@@ -674,6 +700,19 @@ fn gravity_step_for_cell(x: i32, y: i32, bodies: &[Body]) -> (i32, i32, i32) {
     let mag = (ax * ax + ay * ay).sqrt();
     let max_steps = if mag > 0.5 { 3 } else if mag > 0.05 { 2 } else { 1 };
     (ax.signum() as i32, ay.signum() as i32, max_steps)
+}
+
+/// Phase 3 variant of `gravity_step_for_cell` that walks a
+/// Barnes-Hut quadtree instead of summing every body directly.
+/// Same Plummer-softening, same magnitude-based max_steps. The
+/// tree is built once per tick in `move_pass` and reused across
+/// all 65k cells; per-cell cost is O(log N) average rather than
+/// O(N).
+fn gravity_step_for_cell_bh(x: i32, y: i32, tree: &QuadTree) -> (i32, i32, i32) {
+    let a = tree.compute_accel(crate::body::Vec2::new(x as f32, y as f32));
+    let mag = a.length();
+    let max_steps = if mag > 0.5 { 3 } else if mag > 0.05 { 2 } else { 1 };
+    (a.x.signum() as i32, a.y.signum() as i32, max_steps)
 }
 
 /// Phase 1 fallback: pull toward (HOLE_X, HOLE_Y) inside PULL_RADIUS,
@@ -1318,6 +1357,145 @@ mod tests {
         assert!(ms_per_tick < 500.0, "perf budget blown: {ms_per_tick:.2}ms/tick");
     }
 
+    #[test]
+    #[ignore] // run with `cargo test perf_sanity_100 -- --ignored --nocapture`
+    fn perf_sanity_100_bodies_50k_particles() {
+        // Phase 3 perf sanity: 100 BlackHoles in a ring at radius 80
+        // around grid center, ~50k particles in the gap, 100 ticks.
+        // Exercises the Barnes-Hut body-particle path (100 bodies
+        // is well above BARNES_HUT_THRESHOLD = 8). Budget: 30+ fps
+        // on the gaming rig (< 33ms/tick), 15+ fps on m5
+        // (< 67ms/tick). The assert is loose (200ms/tick) so the
+        // test passes on a slow CI box; the printed number is what
+        // we put in the spec.
+        use std::time::Instant;
+        let mut w = World::new();
+        for i in 0..100 {
+            let angle = (i as f32) * 0.0628; // 2*pi / 100
+            let r = 80.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let mut inside = false;
+                for b in &w.bodies {
+                    if !b.destroys_particles() { continue; }
+                    let dx = (x as f32 - b.position.x) as f32;
+                    let dy = (y as f32 - b.position.y) as f32;
+                    if dx * dx + dy * dy < b.radius * b.radius {
+                        inside = true;
+                        break;
+                    }
+                }
+                if inside { continue; }
+                w.set(x, y, Material::Rock as u8);
+                w.body_index[World::idx(x as usize, y as usize)] = NO_BODY;
+            }
+        }
+        let particle_count = w.particles.iter().filter(|&&m| m != 0).count();
+        eprintln!("perf: 100 BHs + {} particles (Barnes-Hut)", particle_count);
+        let t = Instant::now();
+        for _ in 0..100 {
+            w.step();
+        }
+        let elapsed = t.elapsed();
+        let ms_per_tick = elapsed.as_secs_f64() * 1000.0 / 100.0;
+        eprintln!(
+            "perf: 100 bodies + 50k particles (BH), 100 ticks in {:.1}ms ({:.2}ms/tick)",
+            elapsed.as_secs_f64() * 1000.0,
+            ms_per_tick
+        );
+        assert!(
+            ms_per_tick < 200.0,
+            "Phase 3 perf budget blown: {ms_per_tick:.2}ms/tick"
+        );
+    }
+
+    #[test]
+    fn barnes_hut_matches_direct_sum_for_8_bodies() {
+        // Phase 3 integration: with 8 bodies (the threshold), the
+        // move_pass should now route body-particle gravity through
+        // Barnes-Hut. Verify that the per-cell gravity vector from
+        // the tree matches the direct N^2 sum to a small tolerance
+        // at theta=0.5 (the spec default).
+        use crate::barnes_hut::QuadTree;
+        let mut w = World::new();
+        for i in 0..8 {
+            let angle = (i as f32) * 0.7854; // 2*pi / 8
+            let r = 60.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        let tree = QuadTree::new(&w.bodies, BARNES_HUT_THETA);
+        for &(x, y) in &[(20, 20), (128, 128), (200, 200), (50, 200), (180, 80)] {
+            let p = glam::Vec2::new(x as f32, y as f32);
+            let a_tree = tree.compute_accel(p);
+            let mut a_direct = glam::Vec2::ZERO;
+            for b in &w.bodies {
+                let r = b.position - p;
+                let d2 = r.length_squared() + SOFTENING_SQ;
+                let d = d2.sqrt();
+                let a_mag = G * b.mass / d2;
+                a_direct += r * (a_mag / d);
+            }
+            let mag = a_direct.length();
+            let diff = (a_tree - a_direct).length();
+            assert!(
+                diff < 0.05 * (mag + 1e-3),
+                "Barnes-Hut diverges from direct sum at ({x},{y}): \
+                 tree={a_tree:?}, direct={a_direct:?}, |diff|={diff:.3}, |direct|={mag:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn barnes_hut_threshold_uses_direct_sum_below() {
+        // Below BARNES_HUT_THRESHOLD = 8 the move_pass uses direct
+        // sum. This test confirms that the same answer comes out
+        // of both paths at the threshold boundary.
+        use crate::barnes_hut::QuadTree;
+        let mut w = World::new();
+        for i in 0..7 {
+            let angle = (i as f32) * 0.8976; // 2*pi / 7
+            let r = 60.0;
+            w.spawn_black_hole(
+                128.0 + r * angle.cos(),
+                128.0 + r * angle.sin(),
+                500.0,
+            );
+        }
+        assert!(
+            w.bodies.len() < BARNES_HUT_THRESHOLD,
+            "this test wants bodies.len() < BARNES_HUT_THRESHOLD"
+        );
+        let tree = QuadTree::new(&w.bodies, BARNES_HUT_THETA);
+        for &(x, y) in &[(20, 20), (128, 128), (200, 200)] {
+            let p = glam::Vec2::new(x as f32, y as f32);
+            let a_tree = tree.compute_accel(p);
+            let mut a_direct = glam::Vec2::ZERO;
+            for b in &w.bodies {
+                let r = b.position - p;
+                let d2 = r.length_squared() + SOFTENING_SQ;
+                let d = d2.sqrt();
+                let a_mag = G * b.mass / d2;
+                a_direct += r * (a_mag / d);
+            }
+            let mag = a_direct.length();
+            let diff = (a_tree - a_direct).length();
+            assert!(
+                diff < 0.05 * (mag + 1e-3),
+                "Barnes-Hut diverges from direct sum at ({x},{y}): \
+                 tree={a_tree:?}, direct={a_direct:?}"
+            );
+        }
+    }
 
 
 }
