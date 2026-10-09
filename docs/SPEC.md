@@ -2,7 +2,7 @@
 
 **Canonical source of truth: this file.** The vault is a one-way mirror (if/when we create one); this is authoritative. Edit on a branch + PR. No direct-to-main pushes.
 
-> **Status:** Phase 0 — design locked, repo bootstrap. No engine code yet.
+> **Status:** Phase 2 landed on branch `feat/phase-2-multi-body-gravity`. Awaiting PR + review.
 
 ---
 
@@ -142,6 +142,12 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 | 8 | 2026-10-08 | Phase 3: Barnes-Hut on CPU, GPU compute deferred | Tree build is small (≤4000 nodes for 1000 bodies), rebuilds fast on CPU. Pushing tree traversal to GPU requires a full sim→GPU migration — Phase 4+ question. | GPU-only Barnes-Hut (premature optimization; complicates Phase 1/2). |
 | 9 | 2026-10-08 | Render uses one byte per cell (R8Unorm) + a 256-entry palette texture | Material fits in one byte; palette lookup is one shader instruction. Less bandwidth, simpler code. | Rgba8 for sim data (wastes 75% of bandwidth), per-material branch in fragment shader (GPU unfriendly). |
 | 10 | 2026-10-08 | Phase 2: bonds are sticky (once broken, stay broken) | Phase 1 auto-rebonded from adjacency — fine for visual continuity, breaks the disintegration effect in Phase 2 (debris would re-bond into Frankenstein planets). Sticky bonds make the visual signature of mass loss to a black hole work. | Keep auto-rebond (debris heals, disintegration is invisible), perfect-rebuild from adjacency every frame (no notion of "broken" bonds — same as Phase 1). |
+| 11 | 2026-10-08 | Phase 2: per-cell `body_index: i32` tracks owning body | Decouples particle ownership from gravity influence. A planet particle is still attracted to all bodies (BlackHole included) but the event-horizon destruction can decrement the *owning* planet's `particle_budget`. | Re-derive ownership on demand (O(n*m) each tick, hard to keep in sync with `bonds`), attach body id to the `Body` struct (single owner doesn't model multi-body influence). |
+| 12 | 2026-10-08 | Phase 2: per-cell gravity uses sign of net accel + magnitude-scaled `max_steps` (1/2/3) | Re-uses the existing falling-sand movement primitive, no need for sub-cell particle positions. The "tidal peel" still works because adjacent particles feel different accelerations and so take different step directions. | Sub-cell particle positions (more refactor for a difference the user can't see at the spec'd grid size), per-particle velocity vectors (breaks the falling-sand model). |
+| 13 | 2026-10-08 | Phase 2: bodies use leapfrog integration (kick + drift) not pure Verlet | Body-body gravity is `N²/2` ops/tick, the average-accel Verlet requires keeping a *previous* accel cache. Leapfrog stores only the new accel and is also symplectic at dt=1 grid step. Stability is identical for our orbital timescales. | Pure velocity Verlet (extra accel-cache state for marginal benefit at dt=1). |
+| 14 | 2026-10-08 | Phase 2: `Material::EventHorizon` (dark purple) drawn as a cosmetic ring around BlackHole bodies | The spec said "the horizon itself is just a circle of vacuum", but a vacuum circle is invisible against the black background. A dark-purple ring of cells is visually distinct without needing a second render pass or special shader. | Separate render layer for bodies (second draw call, premature for v0.1), shader-side circle rendering (we don't even use the shader's color picker yet, so this is over-engineering). |
+| 15 | 2026-10-08 | Phase 2: event-horizon destruction is strict-less-than (d² < r²), not ≤ | Reads as a circle, not a filled disk. Particles exactly at the horizon stay alive for one tick and form a "buffer zone". The cosmetic EventHorizon ring covers this buffer so the user doesn't notice. | Use ≤ (no buffer; particles at the exact boundary vanish, looks like a 1-cell stutter). |
+| 16 | 2026-10-08 | Phase 2: body velocity Verlet uses `dt=1` (one tick) | Grid step is the natural time unit. Orbit math works out as cells/tick. The decision is "what does dt mean for the symplecticity of the integrator" — at dt=1 the leapfrog integrator is well within its stability range for our G and mass scales. | Variable dt (more bookkeeping, no benefit at this scale). |
 
 ---
 
@@ -180,9 +186,9 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 
 | Phase | Status | What the user can do when done |
 |---|---|---|
-| 0 | IN PROGRESS | `git clone` the repo, see this file, CI is green. |
-| 1 | TODO | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
-| 2 | IN PROGRESS | Place 2+ bodies, see real orbital mechanics. |
+| 0 | DONE | `git clone` the repo, see this file, CI is green. |
+| 1 | DONE | Run `cargo run`, place a planet near the black hole, watch it disintegrate. |
+| 2 | DONE | Place 2+ bodies, see real orbital mechanics. |
 | 3 | TODO | 10k+ particles at 30+ fps. |
 | 4 | TODO | "Place planet" is a primitive with mass/velocity. |
 | 5 | TODO | Playable game with levels. |
@@ -190,6 +196,38 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 ---
 
 ## Session Log
+
+### 2026-10-08 — Session 3: Phase 2 ships on `feat/phase-2-multi-body-gravity`
+
+- New module `src/body.rs` (Body / BodyKind / G / Plummer / horizon
+  constants). `src/scenario.rs` (parse `--bodies "..."` and apply).
+  `World` extended with `bodies`, `body_index`, `bond_state` (sticky).
+- Physics: body-body N² gravity + leapfrog, body-particle N² Plummer
+  gravity drives the falling-sand move pass via sign-of-accel +
+  magnitude-scaled max_steps. Event horizon destroys particles strictly
+  inside `radius`; planet body's `particle_budget` mutates per particle
+  destroyed → its mass mutates in real time.
+- Sticky bonds implemented per spec §"Phase 1 → Phase 2 Transition":
+  `bond_state` is the lifetime mask, `bonds = bond_state & adjacency`,
+  bond break clears `bond_state` bit permanently AND mirror-clears on
+  neighbour cell. New bonds only form on planet spawn.
+- Visual: `Material::EventHorizon` (dark purple) drawn as a 1-cell
+  ring around every BlackHole body — purely cosmetic, not a particle,
+  no bonds.
+- Default scenario: 1 BH at grid center (mass 1000) + 1 planet at
+  r=60 with v=(0, 0.5) → near-collision orbit (v=1.4× v_circ). Over
+  400 ticks the planet loses 11 of 113 particles (gradual strip),
+  mass = 113 → 102, orbit visibly decays.
+- CLI: `--bodies "bh:x=N,y=N,m=N;planet:x=N,y=N,r=N,vx=N,vy=N"`
+  (single-spec or `;`-joined; `--bodies=...` also accepted).
+- 24 tests pass (8 phase-1 sim, 7 phase-2 sim [sticky bonds ×2,
+  event horizon, mass decrement, planet migrate, orbit, slingshot,
+  two-BH tearing], 3 body.rs, 9 scenario.rs). 2 ignored visual-dump
+  tests. perf sanity: 10 BHs + full grid (~65k particles) runs at
+  ~3 ms/tick (~310 fps) in release, well above the 30 fps target.
+- Acceptance criteria 1–5 hit. Criterion 6 (perf budget) hit by ~10×
+  in release on this dev box. Real m5 / gaming-rig numbers pending.
+- Decisions #11–16 in the Decisions Log capture the design calls.
 
 ### 2026-10-08 — Session 1: bootstrap
 - Locked design: 2D, hand-rolled wgpu, per-particle bonds.
