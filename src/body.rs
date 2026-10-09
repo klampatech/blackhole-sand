@@ -38,7 +38,6 @@ pub const SOFTENING_SQ: f32 = SOFTENING * SOFTENING;
 /// BlackHole body are destroyed (cell becomes Vacuum, owning body loses
 /// one from `particle_budget`).
 pub const EVENT_HORIZON_RADIUS: f32 = 3.0;
-pub const EVENT_HORIZON_RADIUS_SQ: f32 = EVENT_HORIZON_RADIUS * EVENT_HORIZON_RADIUS;
 
 /// Bodies in the sim.
 #[derive(Clone, Debug)]
