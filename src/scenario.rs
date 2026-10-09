@@ -130,29 +130,55 @@ fn parse_fields(s: &str) -> Result<std::collections::HashMap<String, f32>, Scena
     Ok(out)
 }
 
-/// Default scenario: one BlackHole near grid center, one Planet on a
-/// near-collision orbit so the user sees the slingshot + disintegration
-/// immediately on `cargo run`. Tuned by hand:
+/// Default scenario: one BlackHole at the grid center, one Planet on a
+/// **circular orbit** so the BH appears stationary to the user.
+/// Tuned so a `cargo run` immediately shows an orbiting planet and the
+/// BH stays essentially still:
 /// * BH at grid center, mass 1000.
-/// * Planet at distance 60 cells to the right of the BH, radius 6 cells
-///   (~ 113 particles, mass=113), tangential velocity 0.5 cells/tick.
-/// * 0.5 cells/tick is roughly the circular velocity at r=60: sqrt(G*M/r)
-///   = sqrt(8e-3*1000/60) = sqrt(0.133) = 0.366 cells/tick. We're 1.4x
-///   faster than circular, so the orbit is eccentric — periapsis drops
-///   inside the tidal zone (~25 cells from BH) for several frames per
-///   cycle, and the near-side rips off every pass.
+/// * Planet at distance 40 cells to the right of the BH, radius 6 cells
+///   (~ 113 particles, mass=113), tangential velocity equal to the
+///   circular velocity at r=40: v_circ = sqrt(G*M/r) = sqrt(8e-3*1000/40)
+///   = sqrt(0.2) = 0.447 cells/tick.
+/// * The orbit period is 2*pi*sqrt(r^3 / G*M) = 2*pi*sqrt(64000/8) =
+///   2*pi*89.4 ≈ 562 ticks (~9.4s @ 60fps). Comfortable to watch.
+/// * The BH orbits the system COM (a tiny 0.4-cell radius) — essentially
+///   stationary in screen pixels thanks to the 9:1 BH:planet mass
+///   ratio. The user sees the planet sweep around a fixed BH.
+/// * **COM-stationary initial velocities.** The BH gets a small
+///   initial velocity `v_BH = -(m_planet/m_BH) * v_planet` so that
+///   `sum(m_i v_i) = 0` at t=0. Without this, the system has a net
+///   y-momentum of `0.5 * 113 = 56.5 mass-units`, which translates
+///   to a COM drift of `v_COM = 56.5 / 1113 ≈ 0.0508 cells/tick` in
+///   the +y direction. Over 400 ticks the COM would translate 20
+///   cells, dragging the BH visibly across the screen. With the
+///   COM-stationary init the BH orbits the COM in a tight 4-cell
+///   circle (tiny in screen pixels) and the user's eye reads the BH
+///   as "fixed at the center of the system".
+///
+/// For tidally-disruptive orbits and slingshots, pass a custom
+/// `--bodies "..."` (see module docs).
 pub fn default_scenario(world: &mut World) {
     world.spawn_black_hole(crate::sim::HOLE_X as f32, crate::sim::HOLE_Y as f32, 1000.0);
     world.spawn_planet(
-        crate::sim::HOLE_X + 60,
+        crate::sim::HOLE_X + 50,
         crate::sim::HOLE_Y,
         6,
         crate::material::Material::Rock as u8,
     );
-    // Set the planet's initial velocity to a near-collision tangent.
+    // Set up a closed circular orbit so the BH and planet both orbit
+    // a stationary COM. Without the BH recoil velocity the system has
+    // net momentum in +y and the BH walks visibly across the grid.
+    let m_planet = world.bodies.last().unwrap().mass; // 113 for radius 6
+    let v_circ = (crate::body::G * 1000.0 / 50.0).sqrt();
     let planet_id = world.bodies.last().unwrap().id;
     if let Some(body) = world.bodies.iter_mut().find(|b| b.id == planet_id) {
-        body.velocity = glam::Vec2::new(0.0, 0.5);
+        body.position = glam::Vec2::new(crate::sim::HOLE_X as f32 + 50.0, crate::sim::HOLE_Y as f32);
+        body.velocity = glam::Vec2::new(0.0, v_circ);
+    }
+    // Recoil: m_BH * v_BH + m_planet * v_planet = 0 ⟹ v_BH = -m_planet/m_BH * v_planet.
+    if let Some(bh) = world.bodies.iter_mut().find(|b| b.destroys_particles()) {
+        let recoil = -m_planet / bh.mass * v_circ;
+        bh.velocity = glam::Vec2::new(0.0, recoil);
     }
 }
 

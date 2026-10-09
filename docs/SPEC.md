@@ -148,6 +148,11 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 | 14 | 2026-10-08 | Phase 2: `Material::EventHorizon` (dark purple) drawn as a cosmetic ring around BlackHole bodies | The spec said "the horizon itself is just a circle of vacuum", but a vacuum circle is invisible against the black background. A dark-purple ring of cells is visually distinct without needing a second render pass or special shader. | Separate render layer for bodies (second draw call, premature for v0.1), shader-side circle rendering (we don't even use the shader's color picker yet, so this is over-engineering). |
 | 15 | 2026-10-08 | Phase 2: event-horizon destruction is strict-less-than (d² < r²), not ≤ | Reads as a circle, not a filled disk. Particles exactly at the horizon stay alive for one tick and form a "buffer zone". The cosmetic EventHorizon ring covers this buffer so the user doesn't notice. | Use ≤ (no buffer; particles at the exact boundary vanish, looks like a 1-cell stutter). |
 | 16 | 2026-10-08 | Phase 2: body velocity Verlet uses `dt=1` (one tick) | Grid step is the natural time unit. Orbit math works out as cells/tick. The decision is "what does dt mean for the symplecticity of the integrator" — at dt=1 the leapfrog integrator is well within its stability range for our G and mass scales. | Variable dt (more bookkeeping, no benefit at this scale). |
+| 17 | 2026-10-08 | Phase 2: `move_pass` uses the in-progress `claim` array as the occupancy map (NOT the original `self.particles`) | The original `find_target` only checked the original grid, so when two particles converged on the same target cell in the same tick the second one silently overwrote the first — up to 60% of a planet's particles could vanish per 40 ticks during a close approach. Routing `claim` through `find_target` fixes this with a one-line change. | Keep checking `self.particles` (silently loses particles during tidal stripping — the user sees a planet "evaporate" without anything being consumed by the BH). |
+| 18 | 2026-10-08 | Phase 2: bodies that hit a wall get their wall-directed velocity zeroed (not reflected) | Reflection inverts the velocity and would put a body back into the world — but with the falling-sand sim the body is also being pulled by gravity, so reflection interacts weirdly with the integrator. Zeroing the wall component lets the body slide along the wall and the integrator remains symplectic. A wall-pinned body is also a problem: a heavy planet body stuck at (0, 0) would pull the BH across the screen for as long as the user watches. | Reflect (looks natural in a hard-edge game, but the integrator treats it as a momentum-reversing collision, which can leak energy), toroidal wrap (visually confusing — bodies disappear off one edge and reappear on the other). |
+| 19 | 2026-10-08 | Phase 2: default scenario uses a **COM-stationary** initial-velocity setup (`v_BH = -(m_planet/m_BH) * v_planet`) | Without this, the planet's tangential velocity gives the system net momentum and the COM drifts in the +v_planet direction. The 9:1 BH:planet mass ratio means the BH orbits the COM at radius `m_planet/(m_BH+m_planet) * r ≈ 4 cells` instead of the COM drifting at ~0.05 cells/tick, which is what the user actually sees as "the BH walking across the screen". | Set both to zero (planet just falls in), use a 100x heavier BH (clutters the cell count and changes the G-vs-mass interpretation). |
+| 20 | 2026-10-08 | Phase 2: default scenario uses a **circular orbit at r=50** with v = v_circ | The previous default (r=60, v=0.5) had eccentricity 0.875 and apocenter ≈ 900 cells — way off the 256×256 grid. The planet flew off the screen in one tick, hit a wall, and the resulting pinned mass dragged the BH around indefinitely. A circular orbit at r=50 with v=v_circ is bounded, fits in the grid, and lets the user watch a complete orbit. For wilder / destructive orbits the user passes a custom `--bodies "..."`. | Keep r=60, v=0.5 (apocenter 900 cells, off-grid — the bug we're fixing), near-circular at r=40 (planet gets fully consumed within 400 ticks of running and the BH retains the orbital velocity, looks like "the BH zoomed around"). |
+| 21 | 2026-10-08 | Phase 2: when a planet body's mass hits 0 (all particles consumed) we zero its velocity and clear its cached accel | NaN guard for `0/0` in the body-body gravity loop. Without it the BH would NaN-pill the moment a planet vanished. | Allow NaN to propagate (BH instantly disappears, looks like a rendering bug, hard to debug). |
 
 ---
 
@@ -196,6 +201,51 @@ Planets *evaporate* under tidal stress, not explode. A particle-by-particle disi
 ---
 
 ## Session Log
+
+### 2026-10-08 — Session 4: Phase 2 hardening — fix BH "zooming" playtest bug
+
+User reported the BH was "zooming around the screen" after consuming a
+planet on their MacBook. Three real bugs behind it:
+
+1. **`move_pass` silently lost particles** during close encounters.
+   `find_target` checked the original grid for occupancy but not the
+   in-progress `claim` array, so two particles converging on the same
+   target cell in the same tick would overwrite each other and the
+   first would vanish. Up to 84 of 113 particles in the default
+   scenario between t=0 and t=200 — silently. The body's
+   `particle_budget` counter said they were still alive, but they
+   weren't on the grid. Fix: pass `claim` into `find_target` and treat
+   claimed cells as occupied. Locked in decision #17.
+
+2. **Frankenstein integrator** was not actually Verlet or leapfrog.
+   The previous code did `position += v + 0.5*a_old` followed by
+   `velocity += a_new` — position uses old accel (Verlet), velocity
+   uses new accel (Forward Euler). Hybrid gains energy each tick and
+   orbits spiral outward. Fix: proper KDK leapfrog
+   (v += 0.5*a_old; x += v; compute a_new; v += 0.5*a_new).
+   Locked in decision #13 (re-confirmed) and verified by new
+   `leapfrog_does_not_gain_energy_in_pure_orbit` test.
+
+3. **Planet pinned at a wall** after the previous default's near-
+   collision orbit threw the planet off the grid. A heavy mass pinned
+   at (0, 255) is a steady sideways pull on the BH. Fix: in
+   `body_leapfrog_first_half` zero the wall-directed velocity when a
+   body would clamp, so it slides along the wall. Locked in decision
+   #18. Also: new default scenario is a circular orbit at r=50 with
+   COM-stationary initial velocities, so the planet never hits a wall
+   in the first place. Locked in decisions #19 and #20.
+
+Tests added: `move_pass_does_not_lose_particles`,
+`leapfrog_does_not_gain_energy_in_pure_orbit`,
+`body_body_gravity_conserves_momentum`. **30 tests pass**, 2 ignored
+(visual dump + perf sanity).
+
+Default scenario now: BH at (128, 128), mass=1000, v=(0, -0.045) (COM
+recoil); planet at (178, 128) on circular orbit r=50 with v=v_circ.
+COM stays at (133, 128); BH orbits the COM at radius 4 cells in a
+tight circle, which reads as "stationary" in the visual. Planet mass
+drops from 113 → ~34 over 800 ticks of tidal stripping but does not
+fully vanish.
 
 ### 2026-10-08 — Session 3: Phase 2 ships on `feat/phase-2-multi-body-gravity`
 
