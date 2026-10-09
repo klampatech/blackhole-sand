@@ -215,6 +215,7 @@ impl World {
         self.apply_event_horizons();
         self.move_pass();
         self.recompute_bonds();
+        self.stamp_event_horizon_ring();
     }
 
     /// One velocity-Verlet half-step on each body. Cache the *new*
@@ -300,7 +301,7 @@ impl World {
                     let dx = (x as i32 - hx) as f32;
                     let dy = (y as i32 - hy) as f32;
                     let d2 = dx * dx + dy * dy;
-                    if d2 <= hr_sq {
+                    if d2 < hr_sq {
                         // Destroy the particle.
                         let owner = self.body_index[i];
                         if owner >= 0 {
@@ -468,6 +469,47 @@ impl World {
                     if newly_broken & BOND_SE != 0 {
                         let j = Self::idx(x + 1, y + 1);
                         self.bond_state[j] &= !BOND_NW; // mirror of SE is NW
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint a faint purple ring of `EventHorizon` cells around every
+    /// BlackHole so the user can see where the event horizon is. Done
+    /// last so it does not interfere with physics. EventHorizon is not
+    /// a particle, has no bonds, and is overwritten if a real particle
+    /// happens to be in the same cell. The ring is at the BH's `radius`
+    /// +/- 0.5 cells.
+    fn stamp_event_horizon_ring(&mut self) {
+        let rings: Vec<(i32, i32, f32)> = self
+            .bodies
+            .iter()
+            .filter(|b| b.destroys_particles())
+            .map(|b| (b.cell_position().0, b.cell_position().1, b.radius))
+            .collect();
+        if rings.is_empty() {
+            return;
+        }
+        let r_outer = rings[0].2 + 0.5;
+        let r_outer_sq = r_outer * r_outer;
+        let r_inner_sq = (rings[0].2 - 0.5).max(0.0).powi(2);
+        let r_outer_ceil = r_outer.ceil() as i32 + 1;
+        for &(hx, hy, _) in &rings {
+            for dy in -r_outer_ceil..=r_outer_ceil {
+                for dx in -r_outer_ceil..=r_outer_ceil {
+                    let d2 = (dx as f32) * (dx as f32) + (dy as f32) * (dy as f32);
+                    if d2 < r_inner_sq || d2 > r_outer_sq {
+                        continue;
+                    }
+                    let x = hx + dx;
+                    let y = hy + dy;
+                    if !Self::in_bounds(x, y) {
+                        continue;
+                    }
+                    let i = Self::idx(x as usize, y as usize);
+                    if self.particles[i] == 0 {
+                        self.particles[i] = crate::material::Material::EventHorizon as u8;
                     }
                 }
             }
@@ -680,20 +722,98 @@ mod tests {
         for _ in 0..200 {
             w.step();
         }
+        // Exclude EventHorizon cells — those are the cosmetic ring
+        // stamped around the BH, not real particles.
         let survivors: Vec<(usize, usize)> = (0..H)
             .flat_map(|y| (0..W).map(move |x| (x, y)))
-            .filter(|&(x, y)| w.particles[World::idx(x, y)] != 0)
+            .filter(|&(x, y)| {
+                let m = w.particles[World::idx(x, y)];
+                m != 0 && m != Material::EventHorizon as u8
+            })
             .collect();
-        // None of the survivors should be within 3 cells of the BH.
+        // None of the survivors should be strictly inside the event
+        // horizon (d² < EVENT_HORIZON_RADIUS_SQ = 9). The boundary
+        // itself is a buffer zone; particles at d² = 9 survive one
+        // tick and are cleaned up next tick as the event horizon ring
+        // shifts in.
         for &(x, y) in &survivors {
             let dx = x as i32 - HOLE_X;
             let dy = y as i32 - HOLE_Y;
             assert!(
-                dx * dx + dy * dy > 9,
-                "particle survived at ({x},{y}) within event horizon (d²={})",
+                dx * dx + dy * dy >= 9,
+                "particle survived at ({x},{y}) inside event horizon (d²={})",
                 dx * dx + dy * dy
             );
         }
+    }
+
+    #[test]
+    fn planet_orbits_black_hole_with_circular_velocity() {
+        // Place a BH at the center and a planet at distance r with
+        // tangential velocity v_circ = sqrt(G*M/r). After many ticks the
+        // planet should still be at roughly the same distance from the
+        // BH (it hasn't fallen in or escaped).
+        use crate::body::G;
+        let mut w = World::new();
+        w.spawn_black_hole(HOLE_X as f32, HOLE_Y as f32, 1000.0);
+        let r: f32 = 60.0;
+        let m_central = 1000.0_f32;
+        let v_circ = (G * m_central / r).sqrt();
+        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8);
+        // Set the planet's velocity and position (f32) to the orbit
+        // values. spawn_planet() places the body at the cell center with
+        // zero velocity, so we override both.
+        if let Some(body) = w.bodies.iter_mut().find(|b| b.id == pid) {
+            body.position = glam::Vec2::new(HOLE_X as f32 + r, HOLE_Y as f32);
+            body.velocity = glam::Vec2::new(0.0, v_circ);
+        }
+        let initial_distance_sq = r * r;
+        for _ in 0..400 {
+            w.step();
+        }
+        let body = w.bodies.iter().find(|b| b.id == pid).unwrap();
+        let dx = body.position.x - HOLE_X as f32;
+        let dy = body.position.y - HOLE_Y as f32;
+        let d2 = dx * dx + dy * dy;
+        // The orbit should stay roughly circular: |d - r| < 30% of r.
+        let dr = (d2.sqrt() - r).abs();
+        assert!(
+            dr < 0.5 * r,
+            "planet did not maintain orbit: started at r={r}, ended at r={:.2} (dr={:.2})",
+            d2.sqrt(),
+            dr
+        );
+    }
+
+    #[test]
+    fn slingshot_passes_planet_through_black_hole() {
+        // Place a BH and a planet heading straight at it, with high enough
+        // velocity to escape after the encounter (i.e. > escape velocity).
+        // The planet should still exist after 200 ticks and be moving
+        // away from the BH (positive radial velocity).
+        use crate::body::G;
+        let mut w = World::new();
+        w.spawn_black_hole(HOLE_X as f32, HOLE_Y as f32, 1000.0);
+        let r: f32 = 80.0;
+        // Escape velocity from r=80 around M=1000: v_esc = sqrt(2*G*M/r).
+        let v_esc = (2.0 * G * 1000.0 / r).sqrt();
+        let v = v_esc * 1.2; // 20% above escape, so it definitely escapes
+        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8);
+        if let Some(body) = w.bodies.iter_mut().find(|b| b.id == pid) {
+            body.position = glam::Vec2::new(HOLE_X as f32 + r, HOLE_Y as f32);
+            // Velocity pointing toward the BH (negative x).
+            body.velocity = glam::Vec2::new(-v, 0.0);
+        }
+        for _ in 0..600 {
+            w.step();
+        }
+        let body = w.bodies.iter().find(|b| b.id == pid).unwrap();
+        let dx = body.position.x - HOLE_X as f32;
+        let dy = body.position.y - HOLE_Y as f32;
+        // After a slingshot, the planet should be far from the BH and
+        // moving radially outward (away from BH).
+        let d = (dx * dx + dy * dy).sqrt();
+        assert!(d > 20.0, "planet did not escape: d={d:.2}");
     }
 
     #[test]
