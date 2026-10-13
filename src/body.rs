@@ -8,8 +8,6 @@
 //!
 //! See `docs/phase-2-multi-body-gravity.md` for the design rationale.
 
-// (H, W are referenced from sim.rs via the W/H re-exports; this import is unused.)
-
 /// f32 2D vector. Bodies live in *grid* coordinates, so position `(128.0,
 /// 64.5)` means "cell column 128, halfway between rows 64 and 65". The
 /// particle grid is coarser — particles snap to the nearest integer cell.
@@ -64,6 +62,21 @@ pub struct Body {
     /// their spawn count and decrement as particles are destroyed. BHs
     /// stay at 0.
     pub particle_budget: u32,
+    /// Bond stress tolerance, in ticks of continuous non-adjacency
+    /// before a bond permanently breaks. Phase 2 follow-up (Session 9
+    /// "structural strength knob").
+    ///
+    /// * `strength = 0` (default, current behavior) — a bond breaks
+    ///   the very first tick it loses adjacency.
+    /// * `strength = N` — a bond holds for up to N ticks of
+    ///   continuous non-adjacency before being permanently cleared.
+    ///   This lets a planet ride out a brief tidal stretch without
+    ///   tearing, even though the falling-sand cells are physically
+    ///   drifting under differential gravity.
+    ///
+    /// Only meaningful for `BodyKind::Planet`; BHs always have
+    /// `strength = 0`.
+    pub strength: u8,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -82,10 +95,23 @@ impl Body {
             radius: EVENT_HORIZON_RADIUS,
             kind: BodyKind::BlackHole,
             particle_budget: 0,
+            // BHs do not bond, so structural strength is meaningless
+            // for them. We set it to 0 explicitly so any future code
+            // that reads `body.strength` for a BH gets the same
+            // default as a brand-new planet.
+            strength: 0,
         }
     }
 
-    pub fn new_planet(id: u32, x: f32, y: f32, vx: f32, vy: f32, particle_count: u32) -> Self {
+    pub fn new_planet(
+        id: u32,
+        x: f32,
+        y: f32,
+        vx: f32,
+        vy: f32,
+        particle_count: u32,
+        strength: u8,
+    ) -> Self {
         Self {
             id,
             position: Vec2::new(x, y),
@@ -95,6 +121,7 @@ impl Body {
             radius: 0.0,
             kind: BodyKind::Planet,
             particle_budget: particle_count,
+            strength,
         }
     }
 
@@ -139,7 +166,7 @@ mod tests {
 
     #[test]
     fn planet_mass_equals_particle_count() {
-        let p = Body::new_planet(2, 50.0, 50.0, 0.5, 0.0, 78);
+        let p = Body::new_planet(2, 50.0, 50.0, 0.5, 0.0, 78, 0);
         assert_eq!(p.particle_budget, 78);
         assert_eq!(p.mass, 78.0);
         assert!(!p.destroys_particles());

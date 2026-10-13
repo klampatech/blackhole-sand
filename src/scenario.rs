@@ -32,6 +32,10 @@ pub enum BodySpec {
         radius: i32,
         vx: f32,
         vy: f32,
+        /// Bond stress tolerance in ticks (see `Body::strength`).
+        /// Defaults to 0 (current behavior — bond breaks on the first
+        /// tick of non-adjacency) when not supplied in the spec.
+        strength: u8,
     },
 }
 
@@ -93,12 +97,24 @@ fn parse_one(spec: &str) -> Result<BodySpec, ScenarioError> {
             let r = fields.get("r").ok_or(ScenarioError::MissingField("r"))?;
             let vx = fields.get("vx").copied().unwrap_or(0.0);
             let vy = fields.get("vy").copied().unwrap_or(0.0);
+            // Strength defaults to 0 (current behavior). The CLI
+            // shorthand is `s=N` to keep it visually distinct from
+            // the velocity fields `vx` / `vy`.
+            let strength_raw = fields.get("s").copied().unwrap_or(0.0);
+            if strength_raw < 0.0 || strength_raw > 255.0 {
+                return Err(ScenarioError::BadValue {
+                    field: "s".to_string(),
+                    value: strength_raw.to_string(),
+                });
+            }
+            let strength = strength_raw as u8;
             Ok(BodySpec::Planet {
                 x: *x,
                 y: *y,
                 radius: *r as i32,
                 vx,
                 vy,
+                strength,
             })
         }
         other => Err(ScenarioError::UnknownKind(other.to_string())),
@@ -135,12 +151,12 @@ fn parse_fields(s: &str) -> Result<std::collections::HashMap<String, f32>, Scena
 /// Tuned so a `cargo run` immediately shows an orbiting planet and the
 /// BH stays essentially still:
 /// * BH at grid center, mass 1000.
-/// * Planet at distance 40 cells to the right of the BH, radius 6 cells
+/// * Planet at distance 50 cells to the right of the BH, radius 6 cells
 ///   (~ 113 particles, mass=113), tangential velocity equal to the
-///   circular velocity at r=40: v_circ = sqrt(G*M/r) = sqrt(8e-3*1000/40)
-///   = sqrt(0.2) = 0.447 cells/tick.
-/// * The orbit period is 2*pi*sqrt(r^3 / G*M) = 2*pi*sqrt(64000/8) =
-///   2*pi*89.4 ≈ 562 ticks (~9.4s @ 60fps). Comfortable to watch.
+///   circular velocity at r=50: v_circ = sqrt(G*M/r) = sqrt(8e-3*1000/50)
+///   = sqrt(0.16) = 0.4 cells/tick.
+/// * The orbit period is 2*pi*sqrt(r^3 / G*M) = 2*pi*sqrt(125000/8) =
+///   2*pi*125.0 ≈ 785 ticks (~13.1s @ 60fps). Comfortable to watch.
 /// * The BH orbits the system COM (a tiny 0.4-cell radius) — essentially
 ///   stationary in screen pixels thanks to the 9:1 BH:planet mass
 ///   ratio. The user sees the planet sweep around a fixed BH.
@@ -164,6 +180,7 @@ pub fn default_scenario(world: &mut World) {
         crate::sim::HOLE_Y,
         6,
         crate::material::Material::Rock as u8,
+        0, // default strength
     );
     // Set up a closed circular orbit so the BH and planet both orbit
     // a stationary COM. Without the BH recoil velocity the system has
@@ -189,19 +206,28 @@ pub fn apply_scenario(world: &mut World, specs: &[BodySpec]) {
             BodySpec::BlackHole { x, y, mass } => {
                 let _ = world.spawn_black_hole(*x, *y, *mass);
             }
-            BodySpec::Planet { x, y, radius, vx, vy } => {
+            BodySpec::Planet { x, y, radius, vx, vy, strength } => {
+                // Round (x, y) once and use the rounded value for BOTH
+                // the particle disk spawn AND the body position. Mixing
+                // the two creates a 0.5-cell offset between the body's
+                // own position and its particle mass — the body sits
+                // up to 0.5 cells off-center from its own gravity
+                // source, which biases every gravity computation. See
+                // SPEC.md "Phase 2 follow-ups" item 1.
+                let (xr, yr) = (x.round(), y.round());
                 let pid = world.spawn_planet(
-                    x.round() as i32,
-                    y.round() as i32,
+                    xr as i32,
+                    yr as i32,
                     *radius,
                     crate::material::Material::Rock as u8,
+                    *strength,
                 );
                 // Override the planet body's velocity (spawn_planet
                 // sets it to 0). Also sync the body's position to the
                 // particle disk center for clean physics.
                 if pid != crate::sim::NO_BODY as u32 {
                     if let Some(b) = world.bodies.iter_mut().find(|b| b.id == pid) {
-                        b.position = glam::Vec2::new(*x, *y);
+                        b.position = glam::Vec2::new(xr, yr);
                         b.velocity = glam::Vec2::new(*vx, *vy);
                     }
                 }
@@ -238,6 +264,7 @@ mod tests {
                 radius: 6,
                 vx: 0.0,
                 vy: 0.5,
+                strength: 0,
             }]
         );
     }
@@ -254,7 +281,7 @@ mod tests {
         let v = parse_bodies("planet:x=180,y=128,r=6").unwrap();
         assert_eq!(
             v[0],
-            BodySpec::Planet { x: 180.0, y: 128.0, radius: 6, vx: 0.0, vy: 0.0 }
+            BodySpec::Planet { x: 180.0, y: 128.0, radius: 6, vx: 0.0, vy: 0.0, strength: 0 }
         );
     }
 
@@ -305,5 +332,64 @@ mod tests {
         assert!(w.bodies[0].destroys_particles());
         assert!(!w.bodies[1].destroys_particles());
         close(w.bodies[1].velocity.y, 0.5);
+    }
+
+    #[test]
+    fn apply_scenario_rounds_body_position_to_particle_disk() {
+        // Regression for SPEC "Phase 2 follow-ups" item 1 (the
+        // BLOCKER). A non-integer CLI spec like
+        // `planet:x=180.5,y=128.0,...` previously caused a 0.5-cell
+        // offset between the body's own `position` and the integer
+        // center of its particle disk. The body sat up to half a
+        // cell off from its own mass, biasing every gravity
+        // computation. Fix: round (x, y) once and use the rounded
+        // value for BOTH the particle spawn AND the body position.
+        let mut w = World::new();
+        let specs = parse_bodies("planet:x=180.5,y=128.5,r=6,vx=0,vy=0").unwrap();
+        apply_scenario(&mut w, &specs);
+        // The Planet body is the only body spawned.
+        let planet = w.bodies.iter().find(|b| !b.destroys_particles()).unwrap();
+        // Body position should match the integer cell at the center
+        // of the particle disk, not the unrounded (180.5, 128.5).
+        assert_eq!(planet.position.x, 181.0);
+        assert_eq!(planet.position.y, 129.0);
+       // And the particle disk should be centered at that integer
+       // cell: cells at (181, 129) must be filled.
+       assert_ne!(w.get(181, 129), 0, "particle disk not at body position");
+   }
+
+    #[test]
+    fn parses_planet_with_strength() {
+        // `s=N` is the CLI knob for `Body::strength` (bond stress
+        // tolerance in ticks). Pin that the parser reads it,
+        // validates the 0..=255 range, and forwards it into the
+        // `BodySpec::Planet { strength }` field.
+        let v = parse_bodies("planet:x=180,y=128,r=6,s=15,vx=0,vy=0.5").unwrap();
+        assert_eq!(
+            v,
+            vec![BodySpec::Planet {
+                x: 180.0,
+                y: 128.0,
+                radius: 6,
+                vx: 0.0,
+                vy: 0.5,
+                strength: 15,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_strength_out_of_range() {
+        // s=N must be a u8: 0..=255 inclusive. 256 and -1 are
+        // both out of range and should surface as BadValue on
+        // the `s` field.
+        match parse_bodies("planet:x=180,y=128,r=6,s=256") {
+            Err(ScenarioError::BadValue { field, .. }) => assert_eq!(field, "s"),
+            other => panic!("expected BadValue(\"s\"), got {other:?}"),
+        }
+        match parse_bodies("planet:x=180,y=128,r=6,s=-1") {
+            Err(ScenarioError::BadValue { field, .. }) => assert_eq!(field, "s"),
+            other => panic!("expected BadValue(\"s\"), got {other:?}"),
+        }
     }
 }
