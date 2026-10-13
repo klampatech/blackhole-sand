@@ -19,6 +19,45 @@ Session-to-session continuity. New entries on top. Keep entries short (4-5 bulle
 
 ## Log
 
+### 2026-10-13 — Session 9: per-bond `strength` knob (playtest fix)
+
+- User playtest feedback on PR #5 Session 8 build: planets visually
+  distort "nearly immediately" because the falling-sand cells
+  drift apart cell-by-cell under differential gravity. User wanted
+  "clean orbit → disruption" but the cell-grain physics tears at
+  the cell scale. User picked option A (per-bond stress tolerance)
+  over B (per-particle velocity refactor) and C (disable click-spawn).
+- New `Body::strength: u8` field + `World::bond_stress: Vec<u8>`
+  (4 bytes per cell, indexed as `bond_stress[4*i + dir_idx]`,
+  saturating at 255, resets to 0 on re-adjacency). `recompute_bonds`
+  rewritten: a bond is permanently broken and cleared from
+  `bond_state` when its stress counter *exceeds* `strength`; with
+  `strength = 0` the bond breaks on the first tick (pre-knob
+  behavior, byte-identical). CLI: `s=N` on planet specs
+  (`BodySpec::Planet { strength: u8, .. }`); defaults to 0;
+  rejects out-of-range as `ScenarioError::BadValue`. Click-spawn
+  passes 0 to preserve the chaos-playtest behavior.
+- 51 tests pass (was 44, +7): `bond_strength_zero_breaks_immediately`,
+  `bond_strength_holds_bond_under_tidal_stretch`,
+  `bond_strength_resets_on_re_adjacency`,
+  `bond_strength_saturates_at_255`,
+  `bond_strength_falls_back_to_zero_for_orphan_cells` (in
+  `sim::tests`); `parses_planet_with_strength`,
+  `rejects_strength_out_of_range` (in `scenario::tests`).
+  3 ignored. Default-scenario dump at t=400 is byte-for-byte
+  identical to the Session 7/8 baseline (BH=(136.73, 124.97),
+  planet=(78.8, 141.9) m=54). `cargo build` is warning-clean.
+- Decision #29 added (per-body `strength` knob, `s=N` CLI, default
+  0, saturation at 255, re-adjacency resets). Session 9 entry
+  added to `docs/SPEC.md` and this file.
+- **Playtest status:** user has not yet re-run the visual playtest
+  on the MacBook. CLI recipes in the Session 9 SPEC entry:
+  `s=0` = current chaos, `s=15` = ~0.25s tolerance, `s=100` at
+  far r = ~1.7s tolerance. Honest expectation: the planet
+  *visually distorts* immediately regardless of `s` (cell-grain
+  physics is fundamental); `s=N` only prevents the planet from
+  *tearing apart* into disconnected pieces for N ticks.
+
 
 ### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
 

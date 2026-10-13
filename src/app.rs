@@ -93,8 +93,14 @@ impl App {
                 // Without this, click-spawned planets are born with
                 // v=(0,0) and fall straight into the BH, which
                 // confuses the playtest (Session 8).
+                // Click-spawn defaults to strength=0 (current
+                // behavior — bond breaks on first tick of
+                // non-adjacency). The user can override per-body
+                // strength via the CLI `--bodies` spec, but the
+                // click-spawn path keeps the simple legacy behavior
+                // so the chaos playtest still works the same.
                 self.world.spawn_planet_in_orbit(
-                    cx, cy, 10, Material::Rock as u8,
+                    cx, cy, 10, Material::Rock as u8, 0,
                 );
             }
         }

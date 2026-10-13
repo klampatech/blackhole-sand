@@ -498,6 +498,119 @@ fix.
 ---
 
 ## Session Log
+### 2026-10-13 — Session 9: per-bond `strength` knob (playtest fix)
+
+MacBook playtest on the Session 8 PR #5 build: planets visually
+distort "nearly immediately" because the falling-sand cells drift
+apart cell-by-cell under differential gravity, snapping every bond
+on the first tick of non-adjacency. The user wanted a
+"clean orbit → disruption" look but the cell-grain physics tears
+at the cell scale. Three options on the table:
+
+* (A) per-bond stress tolerance (`strength` ticks of continuous
+  non-adjacency before permanent break) — this.
+* (B) bigger refactor to per-particle velocity vectors.
+* (C) disable click-spawn (the only spawn path the playtest
+  currently exercises).
+
+User picked A because it preserves the falling-sand model and only
+adds one byte of body state plus 4 bytes per cell of `bond_stress`
+(256 KB total for the 256×256 grid). The default scenario uses
+`s=0` so all Phase 2 tests, perf tests, and the dump test stay
+byte-for-byte identical to the Session 7/8 baseline (verified:
+`t=400` BH=(136.73, 124.97) v=(0.005, 0.017), planet=(78.8, 141.9)
+m=54 — exact match). Click-spawn also uses `s=0` to preserve the
+chaos-playtest behavior the user enjoys.
+
+**New API surface:**
+
+- `Body::strength: u8` field (default 0, max 255). One byte per
+  body — negligible cost.
+- `World::bond_stress: Vec<u8>` — per-cell, 4 bytes per cell,
+  indexed as `bond_stress[4*i + dir_idx]` where `dir_idx` is
+  0=N, 1=E, 2=NE, 3=SE (matches the `BOND_*` bit positions).
+  Saturates at 255. Resets to 0 when the cell re-becomes
+  adjacent to the same-material neighbour.
+- `BodySpec::Planet { strength: u8, .. }` — CLI field
+  `s=N` on planet specs. Defaults to 0 when not supplied.
+  Out-of-range (`< 0` or `> 255`) is `ScenarioError::BadValue`.
+- `World::spawn_planet(.., strength: u8)` and
+  `World::spawn_planet_in_orbit(.., strength: u8)` — the
+  `strength` arg is the last one; all existing call sites pass
+  0 to preserve pre-knob behavior.
+
+**Per-direction `recompute_bonds` rewrite:** for each direction
+bit set in `lifetime`, either the bond is still adjacent (reset
+the counter to 0) or it is stressed this tick (increment the
+counter, saturating at 255). The bit is *permanently broken*
+and cleared from `bond_state` + mirror-cleared on the neighbour
+when the stress counter *exceeds* the owning body's `strength`.
+With `strength = 0` the bond breaks on the first tick of
+non-adjacency, matching the pre-knob sticky-bond behavior bit
+for bit. The `body_index[i]` lookup uses `checked_rem` + bounds
+to defensively fall back to `strength = 0` for orphan cells
+(prevents a read-panic in stray-particle edge cases).
+
+**Tests added (7, all passing):**
+
+- `bond_strength_zero_breaks_immediately` — pre-knob behavior
+  regression guard: with `s=0` a bond cleared in 1 tick.
+- `bond_strength_holds_bond_under_tidal_stretch` — with `s=N`
+  the bond stays in `bond_state` for N ticks of
+  non-adjacency, then clears on tick N+1.
+- `bond_strength_resets_on_re_adjacency` — re-acquiring
+  adjacency while in the holding window resets the stress
+  counter to 0.
+- `bond_strength_saturates_at_255` — the counter clamps at
+  255 instead of wrapping, so a long pause near the BH
+  doesn't reset the bond to "fresh".
+- `bond_strength_falls_back_to_zero_for_orphan_cells` —
+  defensive `checked_rem` + bounds returns 0 for stray
+  cells, matching pre-knob behavior.
+- `parses_planet_with_strength` — parser reads `s=N`.
+- `rejects_strength_out_of_range` — `s=256` and `s=-1`
+  surface as `ScenarioError::BadValue { field: "s" }`.
+
+**Verification:** 51 tests pass (was 44, +7), 3 ignored.
+Default-scenario dump at t=0/40/120/240/400/800 ticks is
+byte-for-byte identical to the Session 7/8 baseline — the
+default scenario uses `s=0` so the change is invisible to it.
+`cargo build` is warning-clean.
+
+**Playtest status:** the user has not yet re-run the visual
+playtest on the MacBook. The CLI knob recipes below are
+queued up for the next playtest session.
+
+**Useful CLI recipes** (decision #29):
+
+```bash
+# Pre-knob behavior (current chaos; the default scenario
+# already runs this and is unaffected by the new code).
+cargo run -- --bodies "bh:x=128,y=128,m=1000;planet:x=228,y=128,r=10,s=0,vx=0,vy=0.283"
+
+# 15 ticks of tolerance — planet holds shape for ~0.25s
+# before tearing.
+cargo run -- --bodies "bh:x=128,y=128,m=1000;planet:x=228,y=128,r=10,s=15,vx=0,vy=0.283"
+
+# 100 ticks of tolerance (~1.7s) at far r — user can find
+# the look they like by sweeping s and r.
+cargo run -- --bodies "bh:x=128,y=128,m=1000;planet:x=248,y=128,r=10,s=100,vx=0,vy=0.258"
+```
+
+Honest expectation: at any r on the 256×256 grid, the planet
+*visually distorts* immediately (cell-grain differential motion
+is fundamental to the falling-sand model), but with `s=N` the
+bond_state retains the bond for N ticks so the planet doesn't
+*tear apart* into disconnected pieces during that window. The
+user can experiment with the knob to find the look they like;
+the cell-grain physics has a fundamental limit that this knob
+papers over rather than removes.
+
+**Next up:** user re-runs the MacBook visual playtest with
+the new knob to find the look they like; PR #5 picks up the
+new commit; Phase 4 (bodies as first-class objects with shape
+templates) remains the next major chunk of work.
+
 
 ### 2026-10-09 — Session 8: click-spawn orbits the BH (playtest fix)
 
@@ -836,4 +949,5 @@ of the speculative "~34" framing.
 | 26 | 2026-10-09 | Phase 3: body-body gravity stays N² pairwise | N bodies is bounded by Phase 4's body templates, so N² body-body gravity is at most 100×100 = 10,000 ops/tick — nothing. The Barnes-Hut tree is for body-particle gravity (which is N×M for N bodies and M particles, and M can be 50k+). | Apply Barnes-Hut to body-body too (the N² cost is 4 orders of magnitude below body-particle; would just add branching and reduce clarity). |
 | 27 | 2026-10-09 | Phase 3: Barnes-Hut tree uses Plummer softening identical to Phase 2 (`d² -> d² + SOFTENING_SQ = d² + 0.25`) | Consistency with the Phase 2 spec. The softening goes into the magnitude (`a_mag = G * M / d²` uses the softened `d²`) but the opening-angle test uses the unsoftened distance so it matches the textbook Barnes-Hut criterion. The visual signature of close encounters is preserved because softening is what keeps the per-cell gravity vector from blowing up near a body. | Hard cutoff (looks unnatural; bodies "skip" past each other — same as Phase 2's rejected option for direct sum), no softening in the tree (numerical instability when two bodies are very close: their CoM is in the same cell and the softened magnitude still overflows). |
 | 28 | 2026-10-09 | Phase 3: click-spawned planets are initialized on a tangential circular orbit around the first BlackHole (`v_circ = sqrt(G * M_BH / r)`, CCW perpendicular to the radial vector), with equal-and-opposite recoil on the BH so the system starts COM-stationary | Phase 1/2 click-spawn used `spawn_planet(cx, cy, ...)` which left the planet at v=(0,0); on the MacBook playtest the user saw the planet fall straight into the BH instead of orbiting — confusing because the default scenario clearly does orbit. Aligning click-spawn with the default scenario (decision #19 + decision #20) means the click-to-orbit interaction matches what the playtest expects. The “first BH wins” rule is good enough because click-spawn is overwhelmingly tested with the single-BH default scenario; if multi-BH scenes become a thing we can revisit with “nearest BH”. Returns `None` when there is no BH, the click is on top of a BH (r near 0), or the spawn footprint is fully occupied. | Disable click-spawn (it’s the visible interaction, disabling would lose user-visible behavior for a UX miss), keep `spawn_planet` and accept the v=0 free-fall (the bug we’re fixing), pick the *nearest* BH (more intuitive for multi-BH scenes but adds bookkeeping for a case we don’t exercise yet). |
+| 29 | 2026-10-13 | Phase 3: per-body `Body::strength: u8` knob — a bond rides out `strength` ticks of continuous non-adjacency before being permanently broken; CLI `s=N` on planet specs (default 0 = current behavior) | MacBook playtest on the Session 8 PR #5 build: planets distort "nearly immediately" because the falling-sand cells drift apart cell-by-cell under differential gravity, snapping every bond on the first tick of non-adjacency. The user wanted a "clean orbit → disruption" visual but the cell-grain physics tears at the cell scale. Three options: (A) per-bond stress tolerance (this), (B) a bigger refactor to per-particle velocity vectors, (C) disable click-spawn. User picked A because it preserves the falling-sand model and only adds one byte of body state plus 4 bytes per cell of `bond_stress` (256 KB total for the 256×256 grid). The default scenario uses `s=0` so all Phase 2 tests, perf tests, and the dump test stay byte-for-byte identical. Click-spawn also uses `s=0` to preserve the chaos-playtest behavior the user enjoys. Re-adjacency while in the holding window resets the stress counter so a planet can recover between tidal pulses. | Disable click-spawn (loses visible interaction; the user wanted the knob, not the removal), per-particle velocity vectors (big Phase 2 refactor that re-models the cell-grain sim), hard threshold on `s/d` (would need to track a per-bond "max stretch" measurement which the cell-grain sim doesn't have; the tick-based knob is the right granularity for the cell sim), global `strength` instead of per-body (the default scenario is fine with the default 0; only custom `--bodies "..."` users would want to tune per-planet, so a per-body knob is no extra cost). |
 > **Status:** Phase 3 (Barnes-Hut) landed on `feat/phase-3-barnes-hut` (commits `e0409b0` + this commit). PR + review pending.

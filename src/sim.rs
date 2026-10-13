@@ -74,6 +74,14 @@ pub const NO_BODY: i32 = -1;
 pub struct World {
     pub particles: Vec<u8>,    // length W*H, material id per cell
     pub bond_state: Vec<u8>,   // length W*H, lifetime bond bitmask
+    /// Per-cell, per-direction "ticks of continuous non-adjacency"
+    /// stress counters. Indexed as `bond_stress[4*i + dir_idx]` where
+    /// `dir_idx` matches the bond bit positions: 0=N, 1=E, 2=NE, 3=SE.
+    /// Saturates at 255. Cleared whenever the corresponding cell
+    /// re-becomes adjacent. Used by `recompute_bonds` together with
+    /// the owning body's `strength` field to decide when a bond
+    /// permanently breaks. Phase 2 follow-up (Session 9).
+    pub bond_stress: Vec<u8>,
     pub body_index: Vec<i32>,  // length W*H, owning body id (or NO_BODY)
     pub bodies: Vec<Body>,
     /// Cached accelerations for the body-body Verlet half-step. Indexed
@@ -88,6 +96,7 @@ impl World {
         Self {
             particles: vec![0; W * H],
             bond_state: vec![0; W * H],
+            bond_stress: vec![0; W * H * 4],
             body_index: vec![NO_BODY; W * H],
             bodies: Vec::new(),
             body_accel: Vec::new(),
@@ -139,11 +148,21 @@ impl World {
         }
     }
 
-    /// Spawn a planet body at `(cx, cy)` with the given radius and material.
-    /// Stamps the new body's id into the `body_index` of every filled cell
-    /// and sets `bond_state` bits for all adjacent same-material cells so
-    /// the planet is fully bonded at spawn.
-    pub fn spawn_planet(&mut self, cx: i32, cy: i32, radius: i32, mat: u8) -> u32 {
+    /// Spawn a planet body at `(cx, cy)` with the given radius, material,
+    /// and structural `strength` (ticks of non-adjacency a bond can ride
+    /// out before permanently breaking; see `Body::strength`). Stamps the
+    /// new body's id into the `body_index` of every filled cell and sets
+    /// `bond_state` bits for all adjacent same-material cells so the
+    /// planet is fully bonded at spawn. Also clears `bond_stress` for
+    /// each filled cell so a fresh planet starts at zero stress.
+    pub fn spawn_planet(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        mat: u8,
+        strength: u8,
+    ) -> u32 {
         if !Material::from_u8(mat).has_bonds() {
             return NO_BODY as u32;
         }
@@ -179,7 +198,10 @@ impl World {
         }
         let filled_count = filled.len() as u32;
 
-        // Stamp body_index and bond_state for each filled cell.
+        // Stamp body_index and bond_state for each filled cell. Also
+        // zero the four direction-slot stress counters for each cell:
+        // a fresh planet should not inherit stress from a prior
+        // occupant of the same cell.
         for &(x, y) in &filled {
             let i = Self::idx(x as usize, y as usize);
             self.body_index[i] = id as i32;
@@ -197,9 +219,22 @@ impl World {
                 b |= BOND_SE;
             }
             self.bond_state[i] = b;
+            let s = 4 * i;
+            self.bond_stress[s] = 0;
+            self.bond_stress[s + 1] = 0;
+            self.bond_stress[s + 2] = 0;
+            self.bond_stress[s + 3] = 0;
         }
 
-        let body = Body::new_planet(id, cx as f32, cy as f32, 0.0, 0.0, filled_count);
+        let body = Body::new_planet(
+            id,
+            cx as f32,
+            cy as f32,
+            0.0,
+            0.0,
+            filled_count,
+            strength,
+        );
         self.bodies.push(body);
         self.body_accel.push(BodyAccel::default());
         id
@@ -231,6 +266,7 @@ impl World {
         cy: i32,
         radius: i32,
         mat: u8,
+        strength: u8,
     ) -> Option<u32> {
         // Find the first BlackHole body. (When multiple BHs are
         // present we do not yet pick "nearest" — click-spawn in this
@@ -261,7 +297,7 @@ impl World {
         // Spawn the planet body in place (same path as the CLI/JSON
         // scenarios). Bail if the spawn refused (no bonds, footprint
         // occupied, etc.).
-        let pid = self.spawn_planet(cx, cy, radius, mat);
+        let pid = self.spawn_planet(cx, cy, radius, mat, strength);
         if pid == NO_BODY as u32 {
             return None;
         }
@@ -511,6 +547,11 @@ impl World {
                         }
                         self.particles[i] = 0;
                         self.bond_state[i] = 0;
+                        let s = 4 * i;
+                        self.bond_stress[s] = 0;
+                        self.bond_stress[s + 1] = 0;
+                        self.bond_stress[s + 2] = 0;
+                        self.bond_stress[s + 3] = 0;
                         break;
                     }
                 }
@@ -663,6 +704,13 @@ impl World {
                 let m = self.particles[i];
                 if !Material::from_u8(m).has_bonds() {
                     self.bond_state[i] = 0;
+                    // Also clear stress: an empty cell owns no bonds,
+                    // so any stress counters are meaningless.
+                    let s = 4 * i;
+                    self.bond_stress[s] = 0;
+                    self.bond_stress[s + 1] = 0;
+                    self.bond_stress[s + 2] = 0;
+                    self.bond_stress[s + 3] = 0;
                     continue;
                 }
                 let mut adj = 0u8;
@@ -688,25 +736,112 @@ impl World {
                 // here, the first time we observe a bond is no longer
                 // adjacent. This is the "sticky" semantic.
                 let lifetime = self.bond_state[i];
-                let still_adjacent = lifetime & adj;
-                let newly_broken = lifetime & !adj;
-                if newly_broken != 0 {
-                    // Clear the broken bits in bond_state.
-                    self.bond_state[i] = still_adjacent;
-                    // And mirror-clear the corresponding bits on the
-                    // neighbour cell. For each newly-broken direction,
-                    // find the neighbour and clear the mirror bit.
-                // Each mirror-clear targets a specific neighbour cell.
-                // The bond bit can outlive its neighbour's bounds:
-                // `move_pass` transports `bond_state` around with the
-                // particle, so a planet particle can carry a `BOND_SE`
-                // bit (set at spawn when its (x+1, y+1) neighbour was
-                // in bounds) into a corner cell where the neighbour is
-                // now OOB. The adjacency check at the top of this
-                // function only validates neighbours that ARE in bounds
-                // — it does not tell us whether the bond was set when
-                // they were. Bounds-check each mirror target here to
-                // avoid an OOB panic on the index.
+
+                // Per-direction stress: for each bit set in `lifetime`,
+                // either the bond is still adjacent (reset the counter
+                // to 0) or the bond is stressed this tick (increment
+                // the counter, saturate at 255). The bit is *permanently
+                // broken* — and cleared from bond_state + mirror-cleared
+                // on the neighbour — when the stress counter exceeds the
+                // owning body's `strength`. With `strength = 0` (default
+                // / current behavior) the bond breaks the very first
+                // tick it loses adjacency. With `strength = N` the bond
+                // rides out up to N ticks of continuous non-adjacency
+                // before tearing.
+                let owner = self.body_index[i];
+                let strength = owner
+                    .checked_rem(self.bodies.len() as i32)
+                    .and_then(|idx| {
+                        if idx >= 0 && (idx as usize) < self.bodies.len() {
+                            Some(self.bodies[idx as usize].strength)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                // Indices into bond_stress[4*i + dir_idx]. Order matches
+                // the BOND_* bit positions: 0=N, 1=E, 2=NE, 3=SE.
+                let s = 4 * i;
+
+                // Process each direction independently. A direction that
+                // is currently adjacent resets its counter; a direction
+                // that is not adjacent accumulates. When stress exceeds
+                // strength, the bit becomes "permanently broken" and
+                // joins the newly_broken set for the mirror-clear pass.
+                let mut newly_broken: u8 = 0;
+                let mut still_lifetime: u8 = 0;
+                if lifetime & BOND_N != 0 {
+                    if adj & BOND_N != 0 {
+                        self.bond_stress[s] = 0;
+                        still_lifetime |= BOND_N;
+                    } else {
+                        let v = self.bond_stress[s].saturating_add(1);
+                        self.bond_stress[s] = v;
+                        if v > strength {
+                            newly_broken |= BOND_N;
+                        } else {
+                            still_lifetime |= BOND_N;
+                        }
+                    }
+                }
+                if lifetime & BOND_E != 0 {
+                    if adj & BOND_E != 0 {
+                        self.bond_stress[s + 1] = 0;
+                        still_lifetime |= BOND_E;
+                    } else {
+                        let v = self.bond_stress[s + 1].saturating_add(1);
+                        self.bond_stress[s + 1] = v;
+                        if v > strength {
+                            newly_broken |= BOND_E;
+                        } else {
+                            still_lifetime |= BOND_E;
+                        }
+                    }
+                }
+                if lifetime & BOND_NE != 0 {
+                    if adj & BOND_NE != 0 {
+                        self.bond_stress[s + 2] = 0;
+                        still_lifetime |= BOND_NE;
+                    } else {
+                        let v = self.bond_stress[s + 2].saturating_add(1);
+                        self.bond_stress[s + 2] = v;
+                        if v > strength {
+                            newly_broken |= BOND_NE;
+                        } else {
+                            still_lifetime |= BOND_NE;
+                        }
+                    }
+                }
+                if lifetime & BOND_SE != 0 {
+                    if adj & BOND_SE != 0 {
+                        self.bond_stress[s + 3] = 0;
+                        still_lifetime |= BOND_SE;
+                    } else {
+                        let v = self.bond_stress[s + 3].saturating_add(1);
+                        self.bond_stress[s + 3] = v;
+                        if v > strength {
+                            newly_broken |= BOND_SE;
+                        } else {
+                            still_lifetime |= BOND_SE;
+                        }
+                    }
+                }
+
+                // Update the bitmask: drop only the permanently broken
+                // bits. The "stressed but holding" bits stay in
+                // `lifetime` so the cell continues to be considered
+                // bonded on subsequent ticks.
+                self.bond_state[i] = still_lifetime;
+
+                // Mirror-clear the permanently-broken bits on the
+                // neighbour cell. Each mirror-clear targets a specific
+                // neighbour cell. The bond bit can outlive its
+                // neighbour's bounds: `move_pass` transports
+                // `bond_state` around with the particle, so a planet
+                // particle can carry a `BOND_SE` bit (set at spawn when
+                // its (x+1, y+1) neighbour was in bounds) into a corner
+                // cell where the neighbour is now OOB. Bounds-check
+                // each mirror target.
                 if newly_broken & BOND_N != 0 && y > 0 {
                     let j = Self::idx(x, y - 1);
                     self.bond_state[j] &= !BOND_S; // mirror of N is S on the cell below
@@ -725,7 +860,6 @@ impl World {
                 }
             }
         }
-    }
     }
 
     /// Paint a faint purple ring of `EventHorizon` cells around every
@@ -877,7 +1011,7 @@ mod tests {
     #[test]
     fn planet_spawns_bonded() {
         let mut w = World::new();
-        w.spawn_planet(50, 50, 5, Material::Rock as u8);
+        w.spawn_planet(50, 50, 5, Material::Rock as u8, 0);
         let n = (45..=55)
             .flat_map(|y| (45..=55).map(move |x| (x, y)))
             .filter(|&(x, y)| w.particles[World::idx(x, y)] != 0)
@@ -903,7 +1037,7 @@ mod tests {
         // mass migrates toward the BH over many ticks — i.e. the
         // Phase 2 gravity path is wired up.
         w.spawn_black_hole(HOLE_X as f32, HOLE_Y as f32, 1000.0);
-        w.spawn_planet(HOLE_X + 60, HOLE_Y, 6, Material::Rock as u8);
+        w.spawn_planet(HOLE_X + 60, HOLE_Y, 6, Material::Rock as u8, 0);
         let start_dx = 60i64;
         for _ in 0..80 {
             w.step();
@@ -943,7 +1077,7 @@ mod tests {
         let mut w = World::new();
         w.spawn_black_hole(64.0, 128.0, 1000.0);
         w.spawn_black_hole(192.0, 128.0, 1000.0);
-        let pid = w.spawn_planet(128, 128, 5, Material::Rock as u8);
+        let pid = w.spawn_planet(128, 128, 5, Material::Rock as u8, 0);
         let initial_count = w.particles.iter().filter(|&&m| m != 0).count();
         assert!(initial_count > 0);
 
@@ -965,7 +1099,7 @@ mod tests {
     #[test]
     fn sticky_bonds_do_not_reform_after_break() {
         let mut w = World::new();
-        let pid = w.spawn_planet(50, 50, 3, Material::Rock as u8);
+        let pid = w.spawn_planet(50, 50, 3, Material::Rock as u8, 0);
         let body_id = w.bodies.iter().find(|b| b.id == pid).unwrap().id;
         // Take a snapshot of bond_state for cells in the planet.
         let snapshot_before: Vec<u8> = (0..H)
@@ -1098,7 +1232,7 @@ mod tests {
         let r: f32 = 60.0;
         let m_central = 1000.0_f32;
         let v_circ = (G * m_central / r).sqrt();
-        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8);
+        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8, 0);
         // Set the planet's velocity and position (f32) to the orbit
         // values. spawn_planet() places the body at the cell center with
         // zero velocity, so we override both.
@@ -1136,7 +1270,7 @@ mod tests {
         // Escape velocity from r=80 around M=1000: v_esc = sqrt(2*G*M/r).
         let v_esc = (2.0 * G * 1000.0 / r).sqrt();
         let v = v_esc * 1.2; // 20% above escape, so it definitely escapes
-        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8);
+        let pid = w.spawn_planet(HOLE_X + r as i32, HOLE_Y, 1, Material::Rock as u8, 0);
         if let Some(body) = w.bodies.iter_mut().find(|b| b.id == pid) {
             body.position = glam::Vec2::new(HOLE_X as f32 + r, HOLE_Y as f32);
             // Velocity pointing toward the BH (negative x).
@@ -1159,7 +1293,7 @@ mod tests {
         let mut w = World::new();
         // Spawn a small 2-cell planet: cells (50,50) and (51,50) are
         // bonded (E bond from (50,50) to (51,50)).
-        w.spawn_planet(50, 50, 1, Material::Rock as u8);
+        w.spawn_planet(50, 50, 1, Material::Rock as u8, 0);
         // Destroy the right cell by hand and run one tick. The left
         // cell's E bond should be cleared permanently in bond_state.
         w.particles[World::idx(51, 50)] = 0;
@@ -1184,7 +1318,7 @@ mod tests {
     fn planet_mass_decrements_when_particles_destroyed() {
         let mut w = World::new();
         w.spawn_black_hole(HOLE_X as f32, HOLE_Y as f32, 1000.0);
-        let pid = w.spawn_planet(HOLE_X + 10, HOLE_Y, 4, Material::Rock as u8);
+        let pid = w.spawn_planet(HOLE_X + 10, HOLE_Y, 4, Material::Rock as u8, 0);
         let initial_budget = w
             .bodies
             .iter()
@@ -1299,7 +1433,7 @@ mod tests {
         //      visibly drift across the screen.)
         let mut w = World::new();
         let bh_id = w.spawn_black_hole(128.0, 128.0, 1000.0);
-        let pid = w.spawn_planet(178, 128, 6, Material::Rock as u8);
+        let pid = w.spawn_planet(178, 128, 6, Material::Rock as u8, 0);
 
         let m_planet = w.bodies.iter().find(|b| b.id == pid).unwrap().mass;
         let v_circ = (G * 1000.0 / 50.0_f32).sqrt();
@@ -1370,7 +1504,7 @@ mod tests {
         let r: f32 = 30.0;
         let m_central = 1000.0_f32;
         let v_circ = (G * m_central / r).sqrt();
-        let pid = w.spawn_planet(128 + r as i32, 128, 1, Material::Rock as u8);
+        let pid = w.spawn_planet(128 + r as i32, 128, 1, Material::Rock as u8, 0);
         if let Some(b) = w.bodies.iter_mut().find(|b| b.id == pid) {
             b.position = glam::Vec2::new(128.0 + r, 128.0);
             b.velocity = glam::Vec2::new(0.0, v_circ);
@@ -1622,7 +1756,7 @@ mod tests {
         let mut w = World::new();
         let bh_id = w.spawn_black_hole(128.0, 128.0, 1000.0);
         let pid = w
-            .spawn_planet_in_orbit(178, 128, 6, Material::Rock as u8)
+            .spawn_planet_in_orbit(178, 128, 6, Material::Rock as u8, 0)
             .expect("spawn_planet_in_orbit should return Some");
 
         let planet = w.bodies.iter().find(|b| b.id == pid).unwrap().clone();
@@ -1685,7 +1819,7 @@ mod tests {
         // No BH -> no orbital reference. The click-spawn should
         // refuse rather than spawn a free-falling planet at v=0.
         let mut w = World::new();
-        let result = w.spawn_planet_in_orbit(100, 100, 5, Material::Rock as u8);
+        let result = w.spawn_planet_in_orbit(100, 100, 5, Material::Rock as u8, 0);
         assert!(
             result.is_none(),
             "spawn_planet_in_orbit should return None when no BH exists"
@@ -1702,7 +1836,7 @@ mod tests {
         // spawn must refuse rather than inject a NaN velocity.
         let mut w = World::new();
         w.spawn_black_hole(128.0, 128.0, 1000.0);
-        let result = w.spawn_planet_in_orbit(128, 128, 5, Material::Rock as u8);
+        let result = w.spawn_planet_in_orbit(128, 128, 5, Material::Rock as u8, 0);
         assert!(
             result.is_none(),
             "spawn_planet_in_orbit should return None when click is on BH"
@@ -1796,21 +1930,216 @@ mod tests {
         // the planet just clips to the grid — partial planet,
         // no panic.
         let mut w = World::new();
-        let pid = w.spawn_planet(255, 255, 10, Material::Rock as u8);
+        let pid = w.spawn_planet(255, 255, 10, Material::Rock as u8, 0);
         assert_eq!(pid, 0, "first body should get id 0");
         // The planet should exist and have at least the center cell.
         let p = w.bodies.iter().find(|b| b.id == pid).unwrap();
         assert!(p.mass > 0.0, "planet should have at least one particle");
         // No OOB indices should have been written.
         for y in 0..H {
-            for x in 0..W {
-                let i = World::idx(x, y);
-                if w.particles[i] != 0 {
-                    assert!(w.body_index[i] == pid as i32 || w.body_index[i] == NO_BODY,
-                        "unexpected body_index at ({x}, {y})");
-                }
-            }
-        }
+           for x in 0..W {
+               let i = World::idx(x, y);
+               if w.particles[i] != 0 {
+                   assert!(w.body_index[i] == pid as i32 || w.body_index[i] == NO_BODY,
+                       "unexpected body_index at ({x}, {y})");
+               }
+           }
+       }
+   }
+
+    // -----------------------------------------------------------------
+    // `Body::strength` knob — bond stress tolerance
+    //
+    // `recompute_bonds` uses a per-cell, per-direction `bond_stress`
+    // counter. A bond rides out `strength` ticks of continuous
+    // non-adjacency before being permanently cleared. With
+    // `strength = 0` (default) the bond breaks on the first tick,
+    // matching pre-knob behavior. The tests below pin that contract.
+    // -----------------------------------------------------------------
+
+    /// With `strength = 0` a bond that loses adjacency is cleared
+    /// from `bond_state` on the very next tick — the pre-knob
+    /// behavior. This is the regression guard: if `strength = 0`
+    /// ever stops being "break on first tick of non-adjacency",
+    /// something is wrong.
+    #[test]
+    fn bond_strength_zero_breaks_immediately() {
+        let mut w = World::new();
+        // Spawn a 1-cell-radius planet so cell (50, 50) is filled
+        // and has bonds set to its in-disk neighbours. The cell
+        // (50, 50) itself is in the middle, so it has all four
+        // sticky-bond bits set after spawn (N from (50, 49), E from
+        // (50, 50) to (51, 50), etc.).
+        w.spawn_planet(50, 50, 1, Material::Rock as u8, 0);
+        let i = World::idx(50, 50);
+        let initial = w.bond_state[i];
+        assert_ne!(initial, 0, "spawn produced no bonds on (50, 50)");
+
+        // Yank the eastern neighbour: change the material so the
+        // adjacency check fails on the next `recompute_bonds` call.
+        w.particles[World::idx(51, 50)] = Material::Ice as u8;
+        w.recompute_bonds();
+
+        // strength=0: every bit that was bonded but lost adjacency
+        // should now be cleared.
+        let lost_e = initial & BOND_E;
+        assert_ne!(lost_e, 0, "test setup: (50, 50) had no E bond to break");
+        assert_eq!(
+            w.bond_state[i] & BOND_E,
+            0,
+            "E bond should clear on first tick of non-adjacency with strength=0"
+        );
     }
 
+    /// With `strength = N` (N > 0) a bond that loses adjacency
+    /// *stays in `bond_state`* for N ticks. On tick N+1 (when
+    /// `stress` first exceeds N) the bond is permanently cleared
+    /// and the bit drops out. The exact contract the user's
+    /// playtest knob depends on.
+    #[test]
+    fn bond_strength_holds_bond_under_tidal_stretch() {
+        let mut w = World::new();
+        const N: u8 = 5;
+        w.spawn_planet(50, 50, 1, Material::Rock as u8, N);
+        let i = World::idx(50, 50);
+        let initial = w.bond_state[i];
+        assert_ne!(initial & BOND_E, 0, "test setup: (50, 50) had no E bond");
+
+        // Yank the eastern neighbour. From this point the E bond
+        // is non-adjacent and will accumulate stress.
+        w.particles[World::idx(51, 50)] = Material::Ice as u8;
+
+        // For N ticks the bond must still be in `bond_state` —
+        // it's "stressed but holding".
+        for tick in 1..=N {
+            w.recompute_bonds();
+            assert_ne!(
+                w.bond_state[i] & BOND_E,
+                0,
+                "E bond dropped at tick {tick} (strength={N}); expected to hold for {N} ticks"
+            );
+            assert_eq!(
+                w.bond_stress[4 * i + 1], // dir_idx 1 == E
+                tick,
+                "E-bond stress should equal elapsed ticks of non-adjacency"
+            );
+        }
+
+        // On tick N+1 the stress counter first exceeds N, so the
+        // bit is permanently cleared.
+        w.recompute_bonds();
+        assert_eq!(
+            w.bond_state[i] & BOND_E,
+            0,
+            "E bond should clear on tick N+1 (strength={N})"
+        );
+    }
+
+    /// Re-adjacency while a bond is "stressed but holding" must
+    /// reset the stress counter to 0. The bond is not *broken* —
+    /// it's a sticky lifetime bond; once broken it stays broken
+    /// forever. But re-acquiring adjacency while still in the
+    /// holding window must clear the counter so a future stretch
+    /// gets a fresh `strength`-tick budget.
+    #[test]
+    fn bond_strength_resets_on_re_adjacency() {
+        let mut w = World::new();
+        const N: u8 = 10;
+        w.spawn_planet(50, 50, 1, Material::Rock as u8, N);
+        let i = World::idx(50, 50);
+        assert_ne!(w.bond_state[i] & BOND_E, 0);
+
+        // Stretch for 3 ticks: stress should reach 3.
+        w.particles[World::idx(51, 50)] = Material::Ice as u8;
+        for _ in 0..3 {
+            w.recompute_bonds();
+        }
+        assert_eq!(w.bond_stress[4 * i + 1], 3);
+
+        // Restore adjacency. The next recompute must reset the
+        // E-bond stress to 0 and the bond bit must stay in
+        // `bond_state` (it never went above strength, so it was
+        // never permanently broken).
+        w.particles[World::idx(51, 50)] = Material::Rock as u8;
+        w.recompute_bonds();
+        assert_eq!(w.bond_stress[4 * i + 1], 0, "stress should reset on re-adjacency");
+        assert_ne!(
+            w.bond_state[i] & BOND_E,
+            0,
+            "bond should still be in bond_state after re-adjacency"
+        );
+    }
+
+    /// `strength` lookup falls back to 0 when the cell's
+    /// `body_index` is out of range or points to NO_BODY. Without
+    /// the defensive `checked_rem` + bounds in `recompute_bonds`
+    /// this would be a read-panic. Pin the fallback to 0 (matches
+    /// the pre-knob behavior for stray cells).
+    #[test]
+    fn bond_strength_falls_back_to_zero_for_orphan_cells() {
+        let mut w = World::new();
+        // Manually stamp a particle + bond_state with no owning
+        // body — simulates a stray rock cell that lost its
+        // `body_index` somehow (in practice this only happens if
+        // the body was fully consumed and the bookkeeping lagged
+        // by one tick).
+        let i = World::idx(50, 50);
+        w.particles[i] = Material::Rock as u8;
+        w.bond_state[i] = BOND_E;
+        w.body_index[i] = NO_BODY;
+
+        // Yank the neighbour so the bond loses adjacency.
+        w.particles[World::idx(51, 50)] = Material::Ice as u8;
+        w.recompute_bonds();
+
+        // strength fallback = 0 -> bond clears on the first tick
+        // of non-adjacency, same as a non-knob world would.
+        assert_eq!(
+            w.bond_state[i] & BOND_E,
+            0,
+            "orphan cell (body_index=NO_BODY) should fall back to strength=0"
+        );
+    }
+
+    /// The stress counter uses `saturating_add`, so it must clamp
+    /// at 255 rather than wrapping back to 0. Without saturation a
+    /// planet that sat non-adjacent for > 255 ticks would have
+    /// its stress counter wrap to 0, the bond would appear "fresh"
+    /// again, and a long pause near the BH would never actually
+    /// tear the bond — silently wrong. Pin that the counter
+    /// plateaus at 255 and the bond bit is still in bond_state
+    /// (it can never naturally break at strength=255; the test
+    /// exercises the saturation path, not the break path).
+    #[test]
+    fn bond_strength_saturates_at_255() {
+        let mut w = World::new();
+        // Spawn with strength=255. A bond can only naturally
+        // break when stress > strength, so at strength=255 the
+        // bond stays in bond_state forever (or at least past
+        // 300 ticks of test run-time). This isolates the
+        // saturation check from the "permanently broken" path.
+        w.spawn_planet(50, 50, 1, Material::Rock as u8, 255);
+        let i = World::idx(50, 50);
+        assert_ne!(w.bond_state[i] & BOND_E, 0);
+
+        // Yank the E neighbour.
+        w.particles[World::idx(51, 50)] = Material::Ice as u8;
+
+        // Run way more than 255 ticks; the counter must clamp at
+        // 255 and the bond bit must remain set (stress never
+        // exceeded strength, so the bond was never permanently
+        // broken).
+        for _ in 0..300 {
+            w.recompute_bonds();
+        }
+        assert_eq!(
+            w.bond_stress[4 * i + 1], 255,
+            "stress should saturate at 255, not wrap"
+        );
+        assert_ne!(
+            w.bond_state[i] & BOND_E,
+            0,
+            "E bond should still be in bond_state after 300 ticks of non-adjacency (strength=255)"
+        );
+    }
 }

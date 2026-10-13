@@ -392,7 +392,7 @@ mod tests {
         let bodies = vec![
             Body::new_black_hole(1, 50.0, 128.0, 1000.0),
             Body::new_black_hole(2, 200.0, 128.0, 500.0),
-            Body::new_planet(3, 128.0, 50.0, 0.0, 0.0, 10),
+            Body::new_planet(3, 128.0, 50.0, 0.0, 0.0, 10, 0),
         ];
         let tree = QuadTree::new(&bodies, 0.1); // small theta = essentially exact
 

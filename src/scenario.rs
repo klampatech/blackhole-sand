@@ -32,6 +32,10 @@ pub enum BodySpec {
         radius: i32,
         vx: f32,
         vy: f32,
+        /// Bond stress tolerance in ticks (see `Body::strength`).
+        /// Defaults to 0 (current behavior — bond breaks on the first
+        /// tick of non-adjacency) when not supplied in the spec.
+        strength: u8,
     },
 }
 
@@ -93,12 +97,24 @@ fn parse_one(spec: &str) -> Result<BodySpec, ScenarioError> {
             let r = fields.get("r").ok_or(ScenarioError::MissingField("r"))?;
             let vx = fields.get("vx").copied().unwrap_or(0.0);
             let vy = fields.get("vy").copied().unwrap_or(0.0);
+            // Strength defaults to 0 (current behavior). The CLI
+            // shorthand is `s=N` to keep it visually distinct from
+            // the velocity fields `vx` / `vy`.
+            let strength_raw = fields.get("s").copied().unwrap_or(0.0);
+            if strength_raw < 0.0 || strength_raw > 255.0 {
+                return Err(ScenarioError::BadValue {
+                    field: "s".to_string(),
+                    value: strength_raw.to_string(),
+                });
+            }
+            let strength = strength_raw as u8;
             Ok(BodySpec::Planet {
                 x: *x,
                 y: *y,
                 radius: *r as i32,
                 vx,
                 vy,
+                strength,
             })
         }
         other => Err(ScenarioError::UnknownKind(other.to_string())),
@@ -164,6 +180,7 @@ pub fn default_scenario(world: &mut World) {
         crate::sim::HOLE_Y,
         6,
         crate::material::Material::Rock as u8,
+        0, // default strength
     );
     // Set up a closed circular orbit so the BH and planet both orbit
     // a stationary COM. Without the BH recoil velocity the system has
@@ -189,7 +206,7 @@ pub fn apply_scenario(world: &mut World, specs: &[BodySpec]) {
             BodySpec::BlackHole { x, y, mass } => {
                 let _ = world.spawn_black_hole(*x, *y, *mass);
             }
-            BodySpec::Planet { x, y, radius, vx, vy } => {
+            BodySpec::Planet { x, y, radius, vx, vy, strength } => {
                 // Round (x, y) once and use the rounded value for BOTH
                 // the particle disk spawn AND the body position. Mixing
                 // the two creates a 0.5-cell offset between the body's
@@ -203,6 +220,7 @@ pub fn apply_scenario(world: &mut World, specs: &[BodySpec]) {
                     yr as i32,
                     *radius,
                     crate::material::Material::Rock as u8,
+                    *strength,
                 );
                 // Override the planet body's velocity (spawn_planet
                 // sets it to 0). Also sync the body's position to the
@@ -246,6 +264,7 @@ mod tests {
                 radius: 6,
                 vx: 0.0,
                 vy: 0.5,
+                strength: 0,
             }]
         );
     }
@@ -262,7 +281,7 @@ mod tests {
         let v = parse_bodies("planet:x=180,y=128,r=6").unwrap();
         assert_eq!(
             v[0],
-            BodySpec::Planet { x: 180.0, y: 128.0, radius: 6, vx: 0.0, vy: 0.0 }
+            BodySpec::Planet { x: 180.0, y: 128.0, radius: 6, vx: 0.0, vy: 0.0, strength: 0 }
         );
     }
 
@@ -334,8 +353,43 @@ mod tests {
         // of the particle disk, not the unrounded (180.5, 128.5).
         assert_eq!(planet.position.x, 181.0);
         assert_eq!(planet.position.y, 129.0);
-        // And the particle disk should be centered at that integer
-        // cell: cells at (181, 129) must be filled.
-        assert_ne!(w.get(181, 129), 0, "particle disk not at body position");
+       // And the particle disk should be centered at that integer
+       // cell: cells at (181, 129) must be filled.
+       assert_ne!(w.get(181, 129), 0, "particle disk not at body position");
+   }
+
+    #[test]
+    fn parses_planet_with_strength() {
+        // `s=N` is the CLI knob for `Body::strength` (bond stress
+        // tolerance in ticks). Pin that the parser reads it,
+        // validates the 0..=255 range, and forwards it into the
+        // `BodySpec::Planet { strength }` field.
+        let v = parse_bodies("planet:x=180,y=128,r=6,s=15,vx=0,vy=0.5").unwrap();
+        assert_eq!(
+            v,
+            vec![BodySpec::Planet {
+                x: 180.0,
+                y: 128.0,
+                radius: 6,
+                vx: 0.0,
+                vy: 0.5,
+                strength: 15,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_strength_out_of_range() {
+        // s=N must be a u8: 0..=255 inclusive. 256 and -1 are
+        // both out of range and should surface as BadValue on
+        // the `s` field.
+        match parse_bodies("planet:x=180,y=128,r=6,s=256") {
+            Err(ScenarioError::BadValue { field, .. }) => assert_eq!(field, "s"),
+            other => panic!("expected BadValue(\"s\"), got {other:?}"),
+        }
+        match parse_bodies("planet:x=180,y=128,r=6,s=-1") {
+            Err(ScenarioError::BadValue { field, .. }) => assert_eq!(field, "s"),
+            other => panic!("expected BadValue(\"s\"), got {other:?}"),
+        }
     }
 }
